@@ -14,12 +14,15 @@ groups/*
 !groups/main/
 !groups/global/
 !groups/whatsapp_main/
+!groups/slack_main/
 groups/main/*
 groups/global/*
 groups/whatsapp_main/*
+groups/slack_main/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 !groups/whatsapp_main/CLAUDE.md
+!groups/slack_main/CLAUDE.md
 
 # Secrets
 *.keys.json

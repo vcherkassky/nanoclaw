@@ -47,6 +47,21 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+## Knowledge Base
+
+The knowledge base is an Obsidian vault mounted at `/workspace/extra/kb/` inside the container (host path: `~/Documents/Knowledge Base/`).
+
+Structure:
+- `Notes/` — Personal notes, ideas, journaling
+- `Projects/` — Project docs, meeting notes, tasks (one subfolder per project)
+- `Research/` — Summaries of articles, books, topics
+
+When asked to save, look up, or summarise notes:
+- Read relevant `.md` files to answer questions
+- Create new notes under `/workspace/extra/kb/` using the format `YYYY-MM-DD Title.md` for dated notes, `Title.md` for evergreen ones
+- Start each note with a short summary paragraph, then use `#tags` for topics
+- When writing a research summary, include source, key takeaways, and your synthesis
+
 ## Message Formatting
 
 NEVER use markdown. Only use WhatsApp/Telegram formatting:
