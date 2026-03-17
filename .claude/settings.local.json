@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ollama list:*)",
+      "Bash(docker run:*)",
+      "Bash(source ~/.nvm.nvm.sh*)",
+      "Bash(source:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
