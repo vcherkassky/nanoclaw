@@ -13,9 +13,9 @@ import {
   RegisteredGroup,
 } from '../types.js';
 
-// Slack's chat.postMessage API limits text to ~4000 characters per call.
-// Messages exceeding this are split into sequential chunks.
-const MAX_MESSAGE_LENGTH = 4000;
+// Slack block text fields are limited to 3000 characters.
+// Messages exceeding this are split into sequential section blocks.
+const MAX_MESSAGE_LENGTH = 3000;
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
@@ -169,16 +169,18 @@ export class SlackChannel implements Channel {
     }
 
     try {
-      // Slack limits messages to ~4000 characters; split if needed
-      if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
-      } else {
-        for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-          await this.app.client.chat.postMessage({
-            channel: channelId,
-            text: text.slice(i, i + MAX_MESSAGE_LENGTH),
-          });
-        }
+      // Use mrkdwn blocks for proper markdown rendering.
+      // Block text is limited to 3000 chars; split into multiple section blocks if needed.
+      const chunks: string[] = [];
+      for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
+        chunks.push(text.slice(i, i + MAX_MESSAGE_LENGTH));
+      }
+      for (const chunk of chunks) {
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text: chunk, // fallback for notifications/accessibility
+          blocks: [{ type: 'section', text: { type: 'mrkdwn', text: chunk } }],
+        });
       }
       logger.info({ jid, length: text.length }, 'Slack message sent');
     } catch (err) {
@@ -275,6 +277,7 @@ export class SlackChannel implements Channel {
         await this.app.client.chat.postMessage({
           channel: channelId,
           text: item.text,
+          blocks: [{ type: 'section', text: { type: 'mrkdwn', text: item.text } }],
         });
         logger.info(
           { jid: item.jid, length: item.text.length },

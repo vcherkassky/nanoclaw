@@ -75,10 +75,19 @@ Use these when asked about tasks, tickets, or project status.
 
 ## Message Formatting
 
-NEVER use markdown. Only use WhatsApp/Telegram formatting:
+Use the formatting native to the channel you're in:
+
+*WhatsApp / Telegram:*
 - *single asterisks* for bold (NEVER **double asterisks**)
 - _underscores_ for italic
 - • bullet points
 - ```triple backticks``` for code
+- No ## headings. No [links](url).
 
-No ## headings. No [links](url). No **double stars**.
+*Slack:*
+- *single asterisks* for bold
+- _underscores_ for italic
+- `backticks` for inline code, triple backticks for code blocks
+- • or - for bullet points
+- Headings with *Bold text* on its own line
+- <url|link text> for links
