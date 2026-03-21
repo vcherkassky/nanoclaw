@@ -6,6 +6,7 @@ import { google, gmail_v1 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 
 // isMain flag is used instead of MAIN_GROUP_FOLDER constant
+import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -19,6 +20,8 @@ export interface GmailChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  allowedSenders?: Set<string>; // if set, only these addresses trigger the agent
+  targetJid?: string; // if set, deliver to this group JID instead of first main group
 }
 
 interface ThreadMeta {
@@ -91,9 +94,13 @@ export class GmailChannel implements Channel {
 
     // Start polling with error backoff
     const schedulePoll = () => {
-      const backoffMs = this.consecutiveErrors > 0
-        ? Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000)
-        : this.pollIntervalMs;
+      const backoffMs =
+        this.consecutiveErrors > 0
+          ? Math.min(
+              this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+              30 * 60 * 1000,
+            )
+          : this.pollIntervalMs;
       this.pollTimer = setTimeout(() => {
         this.pollForMessages()
           .catch((err) => logger.error({ err }, 'Gmail poll error'))
@@ -210,8 +217,18 @@ export class GmailChannel implements Channel {
       this.consecutiveErrors = 0;
     } catch (err) {
       this.consecutiveErrors++;
-      const backoffMs = Math.min(this.pollIntervalMs * Math.pow(2, this.consecutiveErrors), 30 * 60 * 1000);
-      logger.error({ err, consecutiveErrors: this.consecutiveErrors, nextPollMs: backoffMs }, 'Gmail poll failed');
+      const backoffMs = Math.min(
+        this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
+        30 * 60 * 1000,
+      );
+      logger.error(
+        {
+          err,
+          consecutiveErrors: this.consecutiveErrors,
+          nextPollMs: backoffMs,
+        },
+        'Gmail poll failed',
+      );
     }
   }
 
@@ -245,6 +262,19 @@ export class GmailChannel implements Channel {
     // Skip emails from self (our own replies)
     if (senderEmail === this.userEmail) return;
 
+    // Enforce sender allowlist if configured
+    if (
+      this.opts.allowedSenders &&
+      this.opts.allowedSenders.size > 0 &&
+      !this.opts.allowedSenders.has(senderEmail.toLowerCase())
+    ) {
+      logger.debug(
+        { senderEmail, subject },
+        'Gmail: sender not in allowlist, skipping',
+      );
+      return;
+    }
+
     // Extract body text
     const body = this.extractTextBody(msg.data.payload);
 
@@ -266,21 +296,23 @@ export class GmailChannel implements Channel {
     // Store chat metadata for group discovery
     this.opts.onChatMetadata(chatJid, timestamp, subject, 'gmail', false);
 
-    // Find the main group to deliver the email notification
+    // Find the target group to deliver the email notification
     const groups = this.opts.registeredGroups();
-    const mainEntry = Object.entries(groups).find(
-      ([, g]) => g.isMain === true,
-    );
-
-    if (!mainEntry) {
-      logger.debug(
-        { chatJid, subject },
-        'No main group registered, skipping email',
-      );
-      return;
+    let mainJid: string;
+    if (this.opts.targetJid) {
+      if (!groups[this.opts.targetJid]) {
+        logger.debug({ chatJid, targetJid: this.opts.targetJid }, 'GMAIL_TARGET_JID not registered, skipping email');
+        return;
+      }
+      mainJid = this.opts.targetJid;
+    } else {
+      const mainEntry = Object.entries(groups).find(([, g]) => g.isMain === true);
+      if (!mainEntry) {
+        logger.debug({ chatJid, subject }, 'No main group registered, skipping email');
+        return;
+      }
+      mainJid = mainEntry[0];
     }
-
-    const mainJid = mainEntry[0];
     const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
 
     this.opts.onMessage(mainJid, {
@@ -348,5 +380,13 @@ registerChannel('gmail', (opts: ChannelOpts) => {
     logger.warn('Gmail: credentials not found in ~/.gmail-mcp/');
     return null;
   }
-  return new GmailChannel(opts);
+
+  const env = readEnvFile(['GMAIL_ALLOWED_SENDERS', 'GMAIL_TARGET_JID']);
+  const rawSenders = env['GMAIL_ALLOWED_SENDERS'];
+  const allowedSenders = rawSenders
+    ? new Set<string>(rawSenders.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean))
+    : undefined;
+  const targetJid = env['GMAIL_TARGET_JID'] || undefined;
+
+  return new GmailChannel({ ...opts, allowedSenders, targetJid });
 });
