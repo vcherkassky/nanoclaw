@@ -409,7 +409,8 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__ollama__*',
-        'mcp__linear__*'
+        'mcp__linear__*',
+        'mcp__gmail__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -436,6 +437,10 @@ async function runQuery(
             env: { LINEAR_API_KEY: process.env.LINEAR_API_KEY },
           },
         } : {}),
+        gmail: {
+          command: 'npx',
+          args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+        },
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
