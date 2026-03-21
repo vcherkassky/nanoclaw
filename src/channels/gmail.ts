@@ -301,14 +301,22 @@ export class GmailChannel implements Channel {
     let mainJid: string;
     if (this.opts.targetJid) {
       if (!groups[this.opts.targetJid]) {
-        logger.debug({ chatJid, targetJid: this.opts.targetJid }, 'GMAIL_TARGET_JID not registered, skipping email');
+        logger.debug(
+          { chatJid, targetJid: this.opts.targetJid },
+          'GMAIL_TARGET_JID not registered, skipping email',
+        );
         return;
       }
       mainJid = this.opts.targetJid;
     } else {
-      const mainEntry = Object.entries(groups).find(([, g]) => g.isMain === true);
+      const mainEntry = Object.entries(groups).find(
+        ([, g]) => g.isMain === true,
+      );
       if (!mainEntry) {
-        logger.debug({ chatJid, subject }, 'No main group registered, skipping email');
+        logger.debug(
+          { chatJid, subject },
+          'No main group registered, skipping email',
+        );
         return;
       }
       mainJid = mainEntry[0];
@@ -384,7 +392,12 @@ registerChannel('gmail', (opts: ChannelOpts) => {
   const env = readEnvFile(['GMAIL_ALLOWED_SENDERS', 'GMAIL_TARGET_JID']);
   const rawSenders = env['GMAIL_ALLOWED_SENDERS'];
   const allowedSenders = rawSenders
-    ? new Set<string>(rawSenders.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean))
+    ? new Set<string>(
+        rawSenders
+          .split(',')
+          .map((s) => s.trim().toLowerCase())
+          .filter(Boolean),
+      )
     : undefined;
   const targetJid = env['GMAIL_TARGET_JID'] || undefined;
 
