@@ -508,6 +508,12 @@ async function main(): Promise<void> {
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
+  // Override model via env var — the query() model option is ignored by the SDK,
+  // but ANTHROPIC_MODEL is respected by Claude Code's internal model selection.
+  if (process.env.NANOCLAW_MODEL) {
+    sdkEnv['ANTHROPIC_MODEL'] = process.env.NANOCLAW_MODEL;
+  }
+
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
