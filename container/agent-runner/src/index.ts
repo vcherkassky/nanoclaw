@@ -486,6 +486,23 @@ async function runQuery(
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
+function getSessionModel(sessionId: string): string | null {
+  const sessionPath = `/home/node/.claude/projects/-workspace-group/${sessionId}.jsonl`;
+  if (!fs.existsSync(sessionPath)) return null;
+  try {
+    const lines = fs.readFileSync(sessionPath, 'utf-8').split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        const model = entry?.message?.model;
+        if (model) return model as string;
+      } catch { /* skip malformed lines */ }
+    }
+  } catch { /* unreadable session */ }
+  return null;
+}
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -511,14 +528,19 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
-  // When a custom model is set, don't resume old sessions — they have the
-  // previous model baked in and Claude Code ignores ANTHROPIC_MODEL on resume.
-  let sessionId = process.env.ANTHROPIC_MODEL
-    ? undefined
-    : containerInput.sessionId;
-  if (process.env.ANTHROPIC_MODEL && containerInput.sessionId) {
-    log(`Custom model set, skipping session resume (${containerInput.sessionId})`);
+  let sessionId = containerInput.sessionId;
+
+  // If the session was created with a different model, resuming it causes
+  // Claude Code to send the old model name to the new upstream (e.g. Ollama).
+  // Detect the mismatch and start fresh rather than corrupting the request.
+  if (sessionId && process.env.ANTHROPIC_MODEL) {
+    const sessionModel = getSessionModel(sessionId);
+    if (sessionModel && sessionModel !== process.env.ANTHROPIC_MODEL) {
+      log(`Model mismatch: session=${sessionModel} configured=${process.env.ANTHROPIC_MODEL} — starting new session`);
+      sessionId = undefined;
+    }
   }
+
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale _close sentinel from previous container runs
