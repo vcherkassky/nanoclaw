@@ -511,7 +511,14 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
-  let sessionId = containerInput.sessionId;
+  // When a custom model is set, don't resume old sessions — they have the
+  // previous model baked in and Claude Code ignores ANTHROPIC_MODEL on resume.
+  let sessionId = process.env.ANTHROPIC_MODEL
+    ? undefined
+    : containerInput.sessionId;
+  if (process.env.ANTHROPIC_MODEL && containerInput.sessionId) {
+    log(`Custom model set, skipping session resume (${containerInput.sessionId})`);
+  }
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale _close sentinel from previous container runs
