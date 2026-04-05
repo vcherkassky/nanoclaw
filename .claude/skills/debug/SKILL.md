@@ -17,7 +17,6 @@ src/container-runner.ts               container/agent-runner/
     │ spawns container                      │ runs Claude Agent SDK
     │ with volume mounts                   │ with MCP servers
     │                                      │
-    ├── data/env/env ──────────────> /workspace/env-dir/env
     ├── groups/{folder} ───────────> /workspace/group
     ├── data/ipc/{folder} ────────> /workspace/ipc
     ├── data/sessions/{folder}/.claude/ ──> /home/node/.claude/ (isolated per-group)
@@ -82,16 +81,12 @@ cat .env  # Should show one of:
 
 ### 2. Environment Variables Not Passing
 
-**Runtime note:** Environment variables passed via `-e` may be lost when using `-i` (interactive/piped stdin).
-
-**Workaround:** The system extracts only authentication variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`) from `.env` and mounts them for sourcing inside the container. Other env vars are not exposed.
+**Runtime note:** Credentials are never mounted into containers. Instead, the host credential proxy (`src/credential-proxy.ts`) injects them at the network level — containers connect to the proxy via `ANTHROPIC_BASE_URL` and never see the real keys.
 
 To verify env vars are reaching the container:
 ```bash
-echo '{}' | docker run -i \
-  -v $(pwd)/data/env:/workspace/env-dir:ro \
-  --entrypoint /bin/bash nanoclaw-agent:latest \
-  -c 'export $(cat /workspace/env-dir/env | xargs); echo "OAuth: ${#CLAUDE_CODE_OAUTH_TOKEN} chars, API: ${#ANTHROPIC_API_KEY} chars"'
+echo '{"prompt":"echo $NANOCLAW_MODEL","groupFolder":"test","chatJid":"test@g.us","isMain":false}' | \
+  docker run -i -e NANOCLAW_MODEL=test nanoclaw-agent:latest
 ```
 
 ### 3. Mount Issues
@@ -179,14 +174,12 @@ If an MCP server fails to start, the agent may exit. Check the container logs fo
 
 ### Test the full agent flow:
 ```bash
-# Set up env file
-mkdir -p data/env groups/test
-cp .env data/env/env
+mkdir -p groups/test
 
-# Run test query
 echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMain":false}' | \
   docker run -i \
-  -v $(pwd)/data/env:/workspace/env-dir:ro \
+  -e ANTHROPIC_API_KEY=placeholder \
+  -e ANTHROPIC_BASE_URL=http://host.docker.internal:3001 \
   -v $(pwd)/groups/test:/workspace/group \
   -v $(pwd)/data/ipc:/workspace/ipc \
   nanoclaw-agent:latest
@@ -195,9 +188,9 @@ echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMai
 ### Test Claude Code directly:
 ```bash
 docker run --rm --entrypoint /bin/bash \
-  -v $(pwd)/data/env:/workspace/env-dir:ro \
+  -e ANTHROPIC_API_KEY=placeholder \
+  -e ANTHROPIC_BASE_URL=http://host.docker.internal:3001 \
   nanoclaw-agent:latest -c '
-  export $(cat /workspace/env-dir/env | xargs)
   claude -p "Say hello" --dangerously-skip-permissions --allowedTools ""
 '
 ```
@@ -325,10 +318,7 @@ echo "=== Checking NanoClaw Container Setup ==="
 echo -e "\n1. Authentication configured?"
 [ -f .env ] && (grep -q "CLAUDE_CODE_OAUTH_TOKEN=sk-" .env || grep -q "ANTHROPIC_API_KEY=sk-" .env) && echo "OK" || echo "MISSING - add CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY to .env"
 
-echo -e "\n2. Env file copied for container?"
-[ -f data/env/env ] && echo "OK" || echo "MISSING - will be created on first run"
-
-echo -e "\n3. Container runtime running?"
+echo -e "\n2. Container runtime running?"
 docker info &>/dev/null && echo "OK" || echo "NOT RUNNING - start Docker Desktop (macOS) or sudo systemctl start docker (Linux)"
 
 echo -e "\n4. Container image exists?"
