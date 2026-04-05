@@ -535,7 +535,10 @@ async function main(): Promise<void> {
   // Detect the mismatch and start fresh rather than corrupting the request.
   if (sessionId && process.env.ANTHROPIC_MODEL) {
     const sessionModel = getSessionModel(sessionId);
-    if (sessionModel && sessionModel !== process.env.ANTHROPIC_MODEL) {
+    if (sessionModel === null) {
+      log(`Session ${sessionId} not found — starting new session`);
+      sessionId = undefined;
+    } else if (sessionModel !== process.env.ANTHROPIC_MODEL) {
       log(`Model mismatch: session=${sessionModel} configured=${process.env.ANTHROPIC_MODEL} — starting new session`);
       sessionId = undefined;
     }

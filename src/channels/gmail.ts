@@ -224,11 +224,11 @@ export class GmailChannel implements Channel {
         (err as any)?.response?.status ??
         (err as any)?.status ??
         (err as any)?.code;
-      if (
-        (status === 401 || status === 403) &&
-        !this.reauthInProgress
-      ) {
-        logger.error({ err }, 'Gmail auth error detected, starting re-auth flow');
+      if ((status === 401 || status === 403) && !this.reauthInProgress) {
+        logger.error(
+          { err },
+          'Gmail auth error detected, starting re-auth flow',
+        );
         this.startReauthFlow().catch((e) =>
           logger.error({ e }, 'Gmail re-auth flow failed'),
         );
@@ -269,7 +269,10 @@ export class GmailChannel implements Channel {
         callbackPath = u.pathname;
       }
     } catch (err) {
-      logger.warn({ err }, 'Gmail re-auth: could not parse redirect URI from keys');
+      logger.warn(
+        { err },
+        'Gmail re-auth: could not parse redirect URI from keys',
+      );
     }
 
     const authUrl = this.oauth2Client.generateAuthUrl({
@@ -289,7 +292,10 @@ export class GmailChannel implements Channel {
       logger.warn({ err }, 'Gmail re-auth: failed to send notification');
     }
 
-    logger.info({ port, callbackPath }, 'Gmail re-auth: waiting for OAuth callback');
+    logger.info(
+      { port, callbackPath },
+      'Gmail re-auth: waiting for OAuth callback',
+    );
 
     const server = http.createServer(async (req, res) => {
       const reqUrl = new URL(req.url!, `http://localhost:${port}`);
@@ -332,7 +338,9 @@ export class GmailChannel implements Channel {
         this.gmail = google.gmail({ version: 'v1', auth: this.oauth2Client! });
 
         try {
-          await this.opts.sendNotification?.('Gmail re-authorized successfully. Resuming.');
+          await this.opts.sendNotification?.(
+            'Gmail re-authorized successfully. Resuming.',
+          );
         } catch {}
         logger.info('Gmail re-auth: channel reconnected');
       }
