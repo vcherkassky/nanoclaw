@@ -389,6 +389,10 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const modelName = process.env.NANOCLAW_MODEL || '(default)';
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+  log(`[CONFIG] model=${modelName} upstream=${baseUrl}`);
+
   for await (const message of query({
     prompt: stream,
     options: {

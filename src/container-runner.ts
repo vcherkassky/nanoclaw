@@ -255,6 +255,10 @@ function buildContainerArgs(
   if (NANOCLAW_MODEL) {
     args.push('-e', `NANOCLAW_MODEL=${NANOCLAW_MODEL}`);
   }
+  logger.info(
+    { model: NANOCLAW_MODEL || '(default claude)' },
+    'Container model',
+  );
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
