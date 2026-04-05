@@ -34,6 +34,8 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  usage?: Record<string, number>;
+  costUsd?: number;
 }
 
 interface SessionEntry {
@@ -471,12 +473,20 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
+      const res = message as unknown as {
+        result?: string;
+        subtype?: string;
+        total_cost_usd?: number;
+        usage?: Record<string, number>;
+      };
+      const textResult = res.result ?? null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
         result: textResult || null,
-        newSessionId
+        newSessionId,
+        usage: res.usage,
+        costUsd: res.total_cost_usd,
       });
     }
   }

@@ -18,7 +18,14 @@
       "Bash(grep:*)",
       "WebFetch(domain:ollama.com)",
       "WebSearch",
-      "Bash(./container/build.sh)"
+      "Bash(./container/build.sh)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Read(//Users/viktor/Library/Logs/**)",
+      "Bash(journalctl --user -u nanoclaw -n 50)",
+      "Bash(npm test:*)",
+      "Bash(container list:*)",
+      "Bash(npx vitest:*)"
     ]
   }
 }

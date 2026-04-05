@@ -20,6 +20,10 @@ When a message starts with `[Email from ...]`, it's an incoming email.
 
 **To change these rules** — edit this file (`groups/whatsapp_gmail/CLAUDE.md`).
 
+## Knowledge Base
+
+The knowledge base is mounted at `/workspace/extra/kb/`. Read and write notes there.
+
 ## Saving Code
 
 When you write or generate code, always save it to `/workspace/group/code/` so it persists

@@ -88,6 +88,8 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: mark messages as read. Channels that support it implement it.
+  markRead?(chatJid: string, messages: NewMessage[]): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

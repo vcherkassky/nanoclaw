@@ -60,6 +60,7 @@ function createFakeSocket() {
     },
     sendMessage: vi.fn().mockResolvedValue(undefined),
     sendPresenceUpdate: vi.fn().mockResolvedValue(undefined),
+    readMessages: vi.fn().mockResolvedValue(undefined),
     groupFetchAllParticipating: vi.fn().mockResolvedValue({}),
     end: vi.fn(),
     // Expose the event emitter for triggering events in tests
@@ -930,6 +931,81 @@ describe('WhatsAppChannel', () => {
       // Should not throw
       await expect(
         channel.setTyping('test@g.us', true),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  // --- Mark read ---
+
+  describe('markRead', () => {
+    it('calls readMessages with keys for inbound group messages', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.markRead('registered@g.us', [
+        { id: 'msg-1', chat_jid: 'registered@g.us', sender: '5551234@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
+        { id: 'msg-2', chat_jid: 'registered@g.us', sender: '5555678@s.whatsapp.net', sender_name: 'Bob', content: 'hey', timestamp: 't2', is_from_me: false },
+      ]);
+
+      expect(fakeSocket.readMessages).toHaveBeenCalledWith([
+        { remoteJid: 'registered@g.us', id: 'msg-1', participant: '5551234@s.whatsapp.net', fromMe: false },
+        { remoteJid: 'registered@g.us', id: 'msg-2', participant: '5555678@s.whatsapp.net', fromMe: false },
+      ]);
+    });
+
+    it('omits participant for DM JIDs', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.markRead('123@s.whatsapp.net', [
+        { id: 'msg-1', chat_jid: '123@s.whatsapp.net', sender: '123@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
+      ]);
+
+      expect(fakeSocket.readMessages).toHaveBeenCalledWith([
+        { remoteJid: '123@s.whatsapp.net', id: 'msg-1', participant: undefined, fromMe: false },
+      ]);
+    });
+
+    it('filters out own messages', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.markRead('registered@g.us', [
+        { id: 'msg-1', chat_jid: 'registered@g.us', sender: '5551234@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
+        { id: 'msg-2', chat_jid: 'registered@g.us', sender: 'me@s.whatsapp.net', sender_name: 'Me', content: 'reply', timestamp: 't2', is_from_me: true },
+      ]);
+
+      expect(fakeSocket.readMessages).toHaveBeenCalledWith([
+        { remoteJid: 'registered@g.us', id: 'msg-1', participant: '5551234@s.whatsapp.net', fromMe: false },
+      ]);
+    });
+
+    it('does not call readMessages when all messages are from me', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      await channel.markRead('registered@g.us', [
+        { id: 'msg-1', chat_jid: 'registered@g.us', sender: 'me@s.whatsapp.net', sender_name: 'Me', content: 'hi', timestamp: 't1', is_from_me: true },
+      ]);
+
+      expect(fakeSocket.readMessages).not.toHaveBeenCalled();
+    });
+
+    it('handles readMessages failure gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+      await connectChannel(channel);
+
+      fakeSocket.readMessages.mockRejectedValueOnce(new Error('Network error'));
+
+      await expect(
+        channel.markRead('registered@g.us', [
+          { id: 'msg-1', chat_jid: 'registered@g.us', sender: '5551234@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
+        ]),
       ).resolves.toBeUndefined();
     });
   });

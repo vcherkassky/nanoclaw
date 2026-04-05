@@ -289,6 +289,24 @@ export class WhatsAppChannel implements Channel {
     this.sock?.end(undefined);
   }
 
+  async markRead(chatJid: string, messages: import('../types.js').NewMessage[]): Promise<void> {
+    const keys = messages
+      .filter((m) => !m.is_from_me)
+      .map((m) => ({
+        remoteJid: chatJid,
+        id: m.id,
+        participant: chatJid.endsWith('@g.us') ? m.sender : undefined,
+        fromMe: false as const,
+      }));
+    if (keys.length === 0) return;
+    try {
+      await this.sock.readMessages(keys);
+      logger.debug({ chatJid, count: keys.length }, 'Messages marked as read');
+    } catch (err) {
+      logger.debug({ chatJid, err }, 'Failed to mark messages as read');
+    }
+  }
+
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     try {
       const status = isTyping ? 'composing' : 'paused';

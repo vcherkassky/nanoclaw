@@ -209,6 +209,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  await channel.markRead?.(chatJid, missedMessages);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -221,6 +222,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      if (result.usage || result.costUsd !== undefined) {
+        logger.info(
+          {
+            group: group.name,
+            ...result.usage,
+            costUsd: result.costUsd !== undefined ? +result.costUsd.toFixed(4) : undefined,
+          },
+          'Token usage',
+        );
+      }
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
@@ -421,8 +432,8 @@ async function startMessageLoop(): Promise<void> {
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
           if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
+            logger.info(
+              { group: group.name, count: messagesToSend.length },
               'Piped messages to active container',
             );
             lastAgentTimestamp[chatJid] =
