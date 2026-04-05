@@ -251,12 +251,12 @@ function buildContainerArgs(
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
-  const { NANOCLAW_MODEL } = readEnvFile(['NANOCLAW_MODEL']);
-  if (NANOCLAW_MODEL) {
-    args.push('-e', `NANOCLAW_MODEL=${NANOCLAW_MODEL}`);
+  const { ANTHROPIC_MODEL } = readEnvFile(['ANTHROPIC_MODEL']);
+  if (ANTHROPIC_MODEL) {
+    args.push('-e', `ANTHROPIC_MODEL=${ANTHROPIC_MODEL}`);
   }
   logger.info(
-    { model: NANOCLAW_MODEL || '(default claude)' },
+    { model: ANTHROPIC_MODEL || '(default claude)' },
     'Container model',
   );
 

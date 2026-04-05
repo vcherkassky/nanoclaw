@@ -389,7 +389,7 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  const modelName = process.env.NANOCLAW_MODEL || '(default)';
+  const modelName = process.env.ANTHROPIC_MODEL || '(default)';
   const baseUrl = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
   log(`[CONFIG] model=${modelName} upstream=${baseUrl}`);
 
@@ -397,7 +397,6 @@ async function runQuery(
     prompt: stream,
     options: {
       cwd: '/workspace/group',
-      model: process.env.NANOCLAW_MODEL || undefined,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -508,11 +507,6 @@ async function main(): Promise<void> {
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
-  // Override model via env var — the query() model option is ignored by the SDK,
-  // but ANTHROPIC_MODEL is respected by Claude Code's internal model selection.
-  if (process.env.NANOCLAW_MODEL) {
-    sdkEnv['ANTHROPIC_MODEL'] = process.env.NANOCLAW_MODEL;
-  }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
