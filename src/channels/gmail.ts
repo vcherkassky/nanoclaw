@@ -1,4 +1,5 @@
 import fs from 'fs';
+import http from 'http';
 import os from 'os';
 import path from 'path';
 
@@ -20,6 +21,7 @@ export interface GmailChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  sendNotification?: (text: string) => Promise<void>;
   allowedSenders?: Set<string>; // if set, only these addresses trigger the agent
   targetJid?: string; // if set, deliver to this group JID instead of first main group
 }
@@ -43,6 +45,7 @@ export class GmailChannel implements Channel {
   private threadMeta = new Map<string, ThreadMeta>();
   private consecutiveErrors = 0;
   private userEmail = '';
+  private reauthInProgress = false;
 
   constructor(opts: GmailChannelOpts, pollIntervalMs = 60000) {
     this.opts = opts;
@@ -217,6 +220,20 @@ export class GmailChannel implements Channel {
       this.consecutiveErrors = 0;
     } catch (err) {
       this.consecutiveErrors++;
+      const status =
+        (err as any)?.response?.status ??
+        (err as any)?.status ??
+        (err as any)?.code;
+      if (
+        (status === 401 || status === 403) &&
+        !this.reauthInProgress
+      ) {
+        logger.error({ err }, 'Gmail auth error detected, starting re-auth flow');
+        this.startReauthFlow().catch((e) =>
+          logger.error({ e }, 'Gmail re-auth flow failed'),
+        );
+        return;
+      }
       const backoffMs = Math.min(
         this.pollIntervalMs * Math.pow(2, this.consecutiveErrors),
         30 * 60 * 1000,
@@ -230,6 +247,103 @@ export class GmailChannel implements Channel {
         'Gmail poll failed',
       );
     }
+  }
+
+  private async startReauthFlow(): Promise<void> {
+    if (this.reauthInProgress || !this.oauth2Client) return;
+    this.reauthInProgress = true;
+
+    const credDir = path.join(os.homedir(), '.gmail-mcp');
+    const keysPath = path.join(credDir, 'gcp-oauth.keys.json');
+    const tokensPath = path.join(credDir, 'credentials.json');
+
+    let port = 3000;
+    let callbackPath = '/oauth2callback';
+    try {
+      const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
+      const clientConfig = keys.installed || keys.web || keys;
+      const redirectUri: string = clientConfig.redirect_uris?.[0] || '';
+      if (redirectUri && redirectUri.startsWith('http')) {
+        const u = new URL(redirectUri);
+        port = parseInt(u.port, 10) || (u.protocol === 'https:' ? 443 : 80);
+        callbackPath = u.pathname;
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Gmail re-auth: could not parse redirect URI from keys');
+    }
+
+    const authUrl = this.oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: [
+        'https://www.googleapis.com/auth/gmail.modify',
+        'https://www.googleapis.com/auth/gmail.send',
+      ],
+      prompt: 'consent',
+    });
+
+    try {
+      await this.opts.sendNotification?.(
+        `Gmail authorization has expired.\n\nOpen this link in a browser on the machine running NanoClaw (not your phone):\n${authUrl}`,
+      );
+    } catch (err) {
+      logger.warn({ err }, 'Gmail re-auth: failed to send notification');
+    }
+
+    logger.info({ port, callbackPath }, 'Gmail re-auth: waiting for OAuth callback');
+
+    const server = http.createServer(async (req, res) => {
+      const reqUrl = new URL(req.url!, `http://localhost:${port}`);
+      if (reqUrl.pathname !== callbackPath) {
+        res.writeHead(404);
+        res.end('Not found');
+        return;
+      }
+
+      const code = reqUrl.searchParams.get('code');
+      if (!code) {
+        res.writeHead(400);
+        res.end('Missing authorization code');
+        return;
+      }
+
+      try {
+        const { tokens } = await this.oauth2Client!.getToken(code);
+        this.oauth2Client!.setCredentials(tokens);
+
+        const current = JSON.parse(fs.readFileSync(tokensPath, 'utf-8'));
+        Object.assign(current, tokens);
+        fs.writeFileSync(tokensPath, JSON.stringify(current, null, 2));
+        logger.info('Gmail re-auth: tokens saved');
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(
+          '<html><body><h2>Gmail re-authorized successfully!</h2><p>You can close this tab.</p></body></html>',
+        );
+      } catch (err) {
+        logger.error({ err }, 'Gmail re-auth: token exchange failed');
+        res.writeHead(500);
+        res.end('Authorization failed. Check logs.');
+      } finally {
+        server.close();
+        this.reauthInProgress = false;
+        this.consecutiveErrors = 0;
+
+        // Reinitialize gmail client with fresh credentials
+        this.gmail = google.gmail({ version: 'v1', auth: this.oauth2Client! });
+
+        try {
+          await this.opts.sendNotification?.('Gmail re-authorized successfully. Resuming.');
+        } catch {}
+        logger.info('Gmail re-auth: channel reconnected');
+      }
+    });
+
+    server.on('error', (err) => {
+      logger.error({ err, port }, 'Gmail re-auth: local server error');
+      this.reauthInProgress = false;
+    });
+
+    server.listen(port);
   }
 
   private async processMessage(messageId: string): Promise<void> {

@@ -5,7 +5,20 @@
       "Bash(docker run:*)",
       "Bash(source ~/.nvm.nvm.sh*)",
       "Bash(source:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(./container/build.sh 2>&1 | tail -8)",
+      "Bash(npm run:*)",
+      "Bash(npm install:*)",
+      "Bash(ollama run:*)",
+      "Bash(sqlite3:*)",
+      "Bash(docker volume:*)",
+      "Bash(python3 -c \"import json,sys; [print\\(v['Name'][:12], v.get\\('Labels'\\) or v.get\\('Mountpoint',''\\)\\) for v in json.load\\(sys.stdin\\)]\")",
+      "Bash(docker builder prune:*)",
+      "Bash(docker system df:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:ollama.com)",
+      "WebSearch",
+      "Bash(./container/build.sh)"
     ]
   }
 }

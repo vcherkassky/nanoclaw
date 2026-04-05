@@ -277,7 +277,9 @@ export class SlackChannel implements Channel {
         await this.app.client.chat.postMessage({
           channel: channelId,
           text: item.text,
-          blocks: [{ type: 'section', text: { type: 'mrkdwn', text: item.text } }],
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: item.text } },
+          ],
         });
         logger.info(
           { jid: item.jid, length: item.text.length },

@@ -574,6 +574,22 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    sendNotification: async (text: string) => {
+      const mainEntry = Object.entries(registeredGroups).find(
+        ([, g]) => g.isMain === true,
+      );
+      if (!mainEntry) {
+        logger.warn('sendNotification: no main group found');
+        return;
+      }
+      const [jid] = mainEntry;
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'sendNotification: no channel for main group');
+        return;
+      }
+      await channel.sendMessage(jid, text);
+    },
   };
 
   // Create and connect all registered channels.
