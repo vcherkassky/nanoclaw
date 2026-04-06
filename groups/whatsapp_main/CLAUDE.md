@@ -1,9 +1,5 @@
 # Assistant Instructions
 
-For most tasks, prefer using the `ollama_generate` tool with `qwen3-coder:30b`.
-Only respond directly (without Ollama) if the task requires capabilities Ollama lacks,
-such as complex multi-step tool use, file system access, or long context reasoning.
-
 ## Knowledge Base
 
 The knowledge base is mounted at `/workspace/extra/kb/`. Read and write notes there.
