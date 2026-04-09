@@ -3,10 +3,15 @@ import http from 'http';
 import os from 'os';
 import path from 'path';
 
+import { convert as htmlToText } from 'html-to-text';
+
+import { ErrorBucket } from '../error-bucket.js';
+
 import { google, gmail_v1 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 
 // isMain flag is used instead of MAIN_GROUP_FOLDER constant
+import { classifyEmail, sanitizeEmail } from '../email-classifier.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -21,9 +26,16 @@ export interface GmailChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
-  sendNotification?: (text: string) => Promise<void>;
+  sendNotification?: (text: string, jid?: string) => Promise<void>;
   allowedSenders?: Set<string>; // if set, only these addresses trigger the agent
   targetJid?: string; // if set, deliver to this group JID instead of first main group
+  credentialsDir?: string; // defaults to ~/.gmail-mcp
+  useClassifier?: boolean; // run Ollama security sandbox before passing to agent
+  labelTracking?: boolean; // use label-based tracking instead of mark-as-read
+  processedLabel?: string; // label name for processed emails; default '🤖✅'
+  quarantineLabel?: string; // label name for quarantined emails; default '🤖⚠️'
+  startDateFile?: string; // path to start-date cursor file
+  maxResultsPerPoll?: number; // max emails per poll cycle; default 10
 }
 
 interface ThreadMeta {
@@ -46,14 +58,22 @@ export class GmailChannel implements Channel {
   private consecutiveErrors = 0;
   private userEmail = '';
   private reauthInProgress = false;
+  private processedLabelId: string | null = null;
+  private quarantinedLabelId: string | null = null;
+  private startDate: string | null = null;
+  private readonly errorBucket: ErrorBucket | null;
 
   constructor(opts: GmailChannelOpts, pollIntervalMs = 60000) {
     this.opts = opts;
     this.pollIntervalMs = pollIntervalMs;
+    this.errorBucket = opts.useClassifier
+      ? new ErrorBucket({ threshold: 20, windowMs: 3_600_000, maxPerDay: 3 })
+      : null;
   }
 
   async connect(): Promise<void> {
-    const credDir = path.join(os.homedir(), '.gmail-mcp');
+    const credDir =
+      this.opts.credentialsDir ?? path.join(os.homedir(), '.gmail-mcp');
     const keysPath = path.join(credDir, 'gcp-oauth.keys.json');
     const tokensPath = path.join(credDir, 'credentials.json');
 
@@ -90,6 +110,11 @@ export class GmailChannel implements Channel {
 
     this.gmail = google.gmail({ version: 'v1', auth: this.oauth2Client });
 
+    if (this.opts.labelTracking) {
+      await this.ensureLabels();
+      await this.loadOrCreateStartDate();
+    }
+
     // Verify connection
     const profile = await this.gmail.users.getProfile({ userId: 'me' });
     this.userEmail = profile.data.emailAddress || '';
@@ -113,9 +138,21 @@ export class GmailChannel implements Channel {
       }, backoffMs);
     };
 
-    // Initial poll
-    await this.pollForMessages();
-    schedulePoll();
+    // For the monitor channel, run the first poll in the background with a short
+    // delay. This lets connect() return immediately so all other channels (WhatsApp)
+    // join the channels array and start connecting before any notifications are sent.
+    // WhatsApp's sendMessage already queues outbound messages while connecting, so
+    // quarantine alerts won't be lost even if WhatsApp is still warming up.
+    if (this.opts.useClassifier) {
+      setTimeout(() => {
+        this.pollForMessages()
+          .catch((err) => logger.error({ err }, 'Gmail monitor: initial poll error'))
+          .finally(() => { if (this.gmail) schedulePoll(); });
+      }, 30_000);
+    } else {
+      await this.pollForMessages();
+      schedulePoll();
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
@@ -188,6 +225,10 @@ export class GmailChannel implements Channel {
   // --- Private ---
 
   private buildQuery(): string {
+    if (this.opts.labelTracking && this.startDate) {
+      const label = this.opts.processedLabel ?? '🤖✅';
+      return `NOT label:${label} after:${this.startDate}`;
+    }
     return 'is:unread category:primary';
   }
 
@@ -199,7 +240,7 @@ export class GmailChannel implements Channel {
       const res = await this.gmail.users.messages.list({
         userId: 'me',
         q: query,
-        maxResults: 10,
+        maxResults: this.opts.maxResultsPerPoll ?? 10,
       });
 
       const messages = res.data.messages || [];
@@ -253,7 +294,8 @@ export class GmailChannel implements Channel {
     if (this.reauthInProgress || !this.oauth2Client) return;
     this.reauthInProgress = true;
 
-    const credDir = path.join(os.homedir(), '.gmail-mcp');
+    const credDir =
+      this.opts.credentialsDir ?? path.join(os.homedir(), '.gmail-mcp');
     const keysPath = path.join(credDir, 'gcp-oauth.keys.json');
     const tokensPath = path.join(credDir, 'credentials.json');
 
@@ -443,33 +485,185 @@ export class GmailChannel implements Channel {
       }
       mainJid = mainEntry[0];
     }
-    const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
+    const trunc = (s: string, n: number) =>
+      s.length > n ? s.slice(0, n - 1) + '…' : s;
+    const shortFrom = trunc(senderName || senderEmail, 20);
+    const shortSubject = trunc(subject, 20);
 
-    this.opts.onMessage(mainJid, {
-      id: messageId,
-      chat_jid: mainJid,
-      sender: senderEmail,
-      sender_name: senderName,
-      content,
-      timestamp,
-      is_from_me: false,
-    });
+    let quarantined = false;
 
-    // Mark as read
-    try {
-      await this.gmail.users.messages.modify({
-        userId: 'me',
-        id: messageId,
-        requestBody: { removeLabelIds: ['UNREAD'] },
-      });
-    } catch (err) {
-      logger.warn({ messageId, err }, 'Failed to mark email as read');
+    // Security sandbox — only active for channels with useClassifier: true
+    if (this.opts.useClassifier) {
+      const sanitized = sanitizeEmail(messageId, senderEmail, subject, body);
+      if (!sanitized) {
+        logger.warn({ messageId, senderEmail }, 'Gmail: email failed sanitization, skipping');
+        const trigger = this.errorBucket?.record();
+        if (trigger) {
+          if (trigger.suppressed) {
+            logger.error(
+              { messageId, senderEmail },
+              'Gmail Monitor: daily error notification cap reached — errors are being silently dropped',
+            );
+          } else {
+            await this.opts.sendNotification?.(
+              `⚠️ Gmail Monitor: ${trigger.count} classifier errors in the last hour\nFrom: ${shortFrom} | Subj: ${shortSubject}\nCause: sanitization failure`,
+              this.opts.targetJid,
+            ).catch((err) => logger.error({ err }, 'Gmail: failed to send error notification'));
+          }
+        }
+        return;
+      }
+
+      const classification = await classifyEmail(sanitized);
+
+      if ('retry' in classification) {
+        // Classifier unavailable (Ollama down) — un-track so next poll retries
+        this.processedIds.delete(messageId);
+        logger.warn(
+          { messageId, reason: classification.reason },
+          'Gmail: classifier unavailable, email will be retried',
+        );
+        const trigger = this.errorBucket?.record();
+        if (trigger) {
+          if (trigger.suppressed) {
+            logger.error(
+              { messageId, reason: classification.reason },
+              'Gmail Monitor: daily error notification cap reached — errors are being silently dropped',
+            );
+          } else {
+            await this.opts.sendNotification?.(
+              `⚠️ Gmail Monitor: ${trigger.count} classifier errors in the last hour\nFrom: ${shortFrom} | Subj: ${shortSubject}\nCause: ${classification.reason}`,
+              this.opts.targetJid,
+            ).catch((err) => logger.error({ err }, 'Gmail: failed to send error notification'));
+          }
+        }
+        return; // do NOT apply label or mark as read
+      }
+
+      if (!classification.safe) {
+        const notifMsg =
+          `⚠️ Quarantined\nFrom: ${shortFrom} | Subj: ${shortSubject}\nReason: ${classification.reason}`;
+        await this.opts.sendNotification?.(notifMsg, this.opts.targetJid).catch((err) =>
+          logger.error({ err }, 'Gmail: failed to send quarantine notification'),
+        );
+        quarantined = true;
+        // Fall through to tracking section
+      }
     }
 
-    logger.info(
-      { mainJid, from: senderName, subject },
-      'Gmail email delivered to main group',
-    );
+    if (!quarantined) {
+      const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
+
+      this.opts.onMessage(mainJid, {
+        id: messageId,
+        chat_jid: mainJid,
+        sender: senderEmail,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
+    }
+
+    // Track processing: label (monitor channel) or mark-as-read (PA channel)
+    if (this.opts.labelTracking) {
+      const labelId = quarantined ? this.quarantinedLabelId : this.processedLabelId;
+      if (labelId) {
+        try {
+          await this.gmail.users.messages.modify({
+            userId: 'me',
+            id: messageId,
+            requestBody: { addLabelIds: [labelId] },
+          });
+        } catch (err) {
+          logger.warn({ messageId, err }, 'Gmail: failed to apply tracking label — will retry on next poll');
+          this.processedIds.delete(messageId);
+        }
+      }
+    } else if (!quarantined) {
+      // PA channel: mark as read (quarantined emails don't reach here without labelTracking)
+      try {
+        await this.gmail.users.messages.modify({
+          userId: 'me',
+          id: messageId,
+          requestBody: { removeLabelIds: ['UNREAD'] },
+        });
+      } catch (err) {
+        logger.warn({ messageId, err }, 'Failed to mark email as read');
+      }
+    }
+
+    if (!quarantined) {
+      logger.info(
+        { mainJid, from: senderName, subject },
+        'Gmail email delivered to main group',
+      );
+    }
+  }
+
+  private async ensureLabels(): Promise<void> {
+    if (!this.gmail) return;
+
+    const processedName = this.opts.processedLabel ?? '🤖✅';
+    const quarantineName = this.opts.quarantineLabel ?? '🤖⚠️';
+
+    try {
+      const res = await this.gmail.users.labels.list({ userId: 'me' });
+      const existing = res.data.labels || [];
+
+      const findOrCreate = async (name: string): Promise<string | null> => {
+        const found = existing.find((l) => l.name === name);
+        if (found?.id) return found.id;
+
+        const created = await this.gmail!.users.labels.create({
+          userId: 'me',
+          requestBody: { name },
+        });
+        return created.data.id ?? null;
+      };
+
+      this.processedLabelId = await findOrCreate(processedName);
+      this.quarantinedLabelId = await findOrCreate(quarantineName);
+
+      logger.info(
+        {
+          processed: `${processedName} → ${this.processedLabelId}`,
+          quarantined: `${quarantineName} → ${this.quarantinedLabelId}`,
+        },
+        'Gmail Monitor: labels ready',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Gmail Monitor: failed to ensure labels');
+    }
+  }
+
+  private async loadOrCreateStartDate(): Promise<void> {
+    const filePath =
+      this.opts.startDateFile ??
+      path.join(process.cwd(), 'store', 'gmail-monitor-start.txt');
+
+    if (fs.existsSync(filePath)) {
+      this.startDate = fs.readFileSync(filePath, 'utf-8').trim();
+      logger.info({ startDate: this.startDate }, 'Gmail Monitor: loaded start date cursor');
+      return;
+    }
+
+    const now = new Date();
+    const yyyy = now.getFullYear();
+    const mm = String(now.getMonth() + 1).padStart(2, '0');
+    const dd = String(now.getDate()).padStart(2, '0');
+    this.startDate = `${yyyy}/${mm}/${dd}`;
+
+    try {
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, this.startDate, 'utf-8');
+      logger.info(
+        { startDate: this.startDate, filePath },
+        'Gmail Monitor: created start date cursor',
+      );
+    } catch (err) {
+      logger.warn({ err }, 'Gmail Monitor: could not write start date file');
+    }
   }
 
   private extractTextBody(
@@ -482,15 +676,19 @@ export class GmailChannel implements Channel {
       return Buffer.from(payload.body.data, 'base64').toString('utf-8');
     }
 
-    // Multipart: search parts recursively
+    // Direct text/html body — convert to plain text
+    if (payload.mimeType === 'text/html' && payload.body?.data) {
+      const html = Buffer.from(payload.body.data, 'base64').toString('utf-8');
+      return htmlToText(html, { wordwrap: false });
+    }
+
+    // Multipart: search parts recursively, preferring text/plain
     if (payload.parts) {
-      // Prefer text/plain
       for (const part of payload.parts) {
         if (part.mimeType === 'text/plain' && part.body?.data) {
           return Buffer.from(part.body.data, 'base64').toString('utf-8');
         }
       }
-      // Recurse into nested multipart
       for (const part of payload.parts) {
         const text = this.extractTextBody(part);
         if (text) return text;
@@ -524,4 +722,41 @@ registerChannel('gmail', (opts: ChannelOpts) => {
   const targetJid = env['GMAIL_TARGET_JID'] || undefined;
 
   return new GmailChannel({ ...opts, allowedSenders, targetJid });
+});
+
+registerChannel('gmail-monitor', (opts: ChannelOpts) => {
+  const env = readEnvFile([
+    'MONITOR_GMAIL_CREDENTIALS_DIR',
+    'PUBLIC_INBOX_TARGET_JID',
+    'MONITOR_PROCESSED_LABEL',
+    'MONITOR_QUARANTINE_LABEL',
+  ]);
+  const credDir =
+    env['MONITOR_GMAIL_CREDENTIALS_DIR'] ??
+    path.join(os.homedir(), '.gmail-monitor');
+
+  if (
+    !fs.existsSync(path.join(credDir, 'gcp-oauth.keys.json')) ||
+    !fs.existsSync(path.join(credDir, 'credentials.json'))
+  ) {
+    logger.warn(
+      `Gmail Monitor: credentials not found in ${credDir}. Run the Gmail auth flow for the monitored account.`,
+    );
+    return null;
+  }
+
+  const targetJid = env['PUBLIC_INBOX_TARGET_JID'] || undefined;
+
+  return new GmailChannel({
+    ...opts,
+    credentialsDir: credDir,
+    useClassifier: true,
+    labelTracking: true,
+    processedLabel: env['MONITOR_PROCESSED_LABEL'] || '🤖✅',
+    quarantineLabel: env['MONITOR_QUARANTINE_LABEL'] || '🤖⚠️',
+    startDateFile: path.join(process.cwd(), 'store', 'gmail-monitor-start.txt'),
+    maxResultsPerPoll: 10,
+    allowedSenders: undefined, // public inbox — no sender restriction
+    targetJid,
+  });
 });

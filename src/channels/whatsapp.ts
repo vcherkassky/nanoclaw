@@ -289,7 +289,10 @@ export class WhatsAppChannel implements Channel {
     this.sock?.end(undefined);
   }
 
-  async markRead(chatJid: string, messages: import('../types.js').NewMessage[]): Promise<void> {
+  async markRead(
+    chatJid: string,
+    messages: import('../types.js').NewMessage[],
+  ): Promise<void> {
     const keys = messages
       .filter((m) => !m.is_from_me)
       .map((m) => ({

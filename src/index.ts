@@ -144,6 +144,22 @@ export function _setRegisteredGroups(
   registeredGroups = groups;
 }
 
+/** @internal - exported for testing */
+export function _setChannels(ch: Channel[]): void {
+  channels.length = 0;
+  channels.push(...ch);
+}
+
+/** @internal - exported for testing */
+export function _resetLastAgentTimestamp(): void {
+  for (const key of Object.keys(lastAgentTimestamp)) {
+    delete lastAgentTimestamp[key];
+  }
+}
+
+/** @internal - exported for testing */
+export { processGroupMessages as _processGroupMessages };
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -227,7 +243,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           {
             group: group.name,
             ...result.usage,
-            costUsd: result.costUsd !== undefined ? +result.costUsd.toFixed(4) : undefined,
+            costUsd:
+              result.costUsd !== undefined
+                ? +result.costUsd.toFixed(4)
+                : undefined,
           },
           'Token usage',
         );
@@ -263,6 +282,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
+    // Notify the user that the agent failed before sending anything
+    await channel
+      .sendMessage(chatJid, 'Agent error — please try again.')
+      .catch((err) => logger.warn({ chatJid, err }, 'Failed to send error notification'));
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
@@ -585,18 +608,21 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
-    sendNotification: async (text: string) => {
-      const mainEntry = Object.entries(registeredGroups).find(
-        ([, g]) => g.isMain === true,
-      );
-      if (!mainEntry) {
-        logger.warn('sendNotification: no main group found');
-        return;
+    sendNotification: async (text: string, targetJid?: string) => {
+      let jid = targetJid;
+      if (!jid) {
+        const mainEntry = Object.entries(registeredGroups).find(
+          ([, g]) => g.isMain === true,
+        );
+        if (!mainEntry) {
+          logger.warn('sendNotification: no main group found');
+          return;
+        }
+        jid = mainEntry[0];
       }
-      const [jid] = mainEntry;
       const channel = findChannel(channels, jid);
       if (!channel) {
-        logger.warn({ jid }, 'sendNotification: no channel for main group');
+        logger.warn({ jid }, 'sendNotification: no channel for jid');
         return;
       }
       await channel.sendMessage(jid, text);

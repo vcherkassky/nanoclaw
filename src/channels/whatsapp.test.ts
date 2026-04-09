@@ -944,13 +944,39 @@ describe('WhatsAppChannel', () => {
       await connectChannel(channel);
 
       await channel.markRead('registered@g.us', [
-        { id: 'msg-1', chat_jid: 'registered@g.us', sender: '5551234@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
-        { id: 'msg-2', chat_jid: 'registered@g.us', sender: '5555678@s.whatsapp.net', sender_name: 'Bob', content: 'hey', timestamp: 't2', is_from_me: false },
+        {
+          id: 'msg-1',
+          chat_jid: 'registered@g.us',
+          sender: '5551234@s.whatsapp.net',
+          sender_name: 'Alice',
+          content: 'hi',
+          timestamp: 't1',
+          is_from_me: false,
+        },
+        {
+          id: 'msg-2',
+          chat_jid: 'registered@g.us',
+          sender: '5555678@s.whatsapp.net',
+          sender_name: 'Bob',
+          content: 'hey',
+          timestamp: 't2',
+          is_from_me: false,
+        },
       ]);
 
       expect(fakeSocket.readMessages).toHaveBeenCalledWith([
-        { remoteJid: 'registered@g.us', id: 'msg-1', participant: '5551234@s.whatsapp.net', fromMe: false },
-        { remoteJid: 'registered@g.us', id: 'msg-2', participant: '5555678@s.whatsapp.net', fromMe: false },
+        {
+          remoteJid: 'registered@g.us',
+          id: 'msg-1',
+          participant: '5551234@s.whatsapp.net',
+          fromMe: false,
+        },
+        {
+          remoteJid: 'registered@g.us',
+          id: 'msg-2',
+          participant: '5555678@s.whatsapp.net',
+          fromMe: false,
+        },
       ]);
     });
 
@@ -960,11 +986,24 @@ describe('WhatsAppChannel', () => {
       await connectChannel(channel);
 
       await channel.markRead('123@s.whatsapp.net', [
-        { id: 'msg-1', chat_jid: '123@s.whatsapp.net', sender: '123@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
+        {
+          id: 'msg-1',
+          chat_jid: '123@s.whatsapp.net',
+          sender: '123@s.whatsapp.net',
+          sender_name: 'Alice',
+          content: 'hi',
+          timestamp: 't1',
+          is_from_me: false,
+        },
       ]);
 
       expect(fakeSocket.readMessages).toHaveBeenCalledWith([
-        { remoteJid: '123@s.whatsapp.net', id: 'msg-1', participant: undefined, fromMe: false },
+        {
+          remoteJid: '123@s.whatsapp.net',
+          id: 'msg-1',
+          participant: undefined,
+          fromMe: false,
+        },
       ]);
     });
 
@@ -974,12 +1013,33 @@ describe('WhatsAppChannel', () => {
       await connectChannel(channel);
 
       await channel.markRead('registered@g.us', [
-        { id: 'msg-1', chat_jid: 'registered@g.us', sender: '5551234@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
-        { id: 'msg-2', chat_jid: 'registered@g.us', sender: 'me@s.whatsapp.net', sender_name: 'Me', content: 'reply', timestamp: 't2', is_from_me: true },
+        {
+          id: 'msg-1',
+          chat_jid: 'registered@g.us',
+          sender: '5551234@s.whatsapp.net',
+          sender_name: 'Alice',
+          content: 'hi',
+          timestamp: 't1',
+          is_from_me: false,
+        },
+        {
+          id: 'msg-2',
+          chat_jid: 'registered@g.us',
+          sender: 'me@s.whatsapp.net',
+          sender_name: 'Me',
+          content: 'reply',
+          timestamp: 't2',
+          is_from_me: true,
+        },
       ]);
 
       expect(fakeSocket.readMessages).toHaveBeenCalledWith([
-        { remoteJid: 'registered@g.us', id: 'msg-1', participant: '5551234@s.whatsapp.net', fromMe: false },
+        {
+          remoteJid: 'registered@g.us',
+          id: 'msg-1',
+          participant: '5551234@s.whatsapp.net',
+          fromMe: false,
+        },
       ]);
     });
 
@@ -989,7 +1049,15 @@ describe('WhatsAppChannel', () => {
       await connectChannel(channel);
 
       await channel.markRead('registered@g.us', [
-        { id: 'msg-1', chat_jid: 'registered@g.us', sender: 'me@s.whatsapp.net', sender_name: 'Me', content: 'hi', timestamp: 't1', is_from_me: true },
+        {
+          id: 'msg-1',
+          chat_jid: 'registered@g.us',
+          sender: 'me@s.whatsapp.net',
+          sender_name: 'Me',
+          content: 'hi',
+          timestamp: 't1',
+          is_from_me: true,
+        },
       ]);
 
       expect(fakeSocket.readMessages).not.toHaveBeenCalled();
@@ -1004,7 +1072,15 @@ describe('WhatsAppChannel', () => {
 
       await expect(
         channel.markRead('registered@g.us', [
-          { id: 'msg-1', chat_jid: 'registered@g.us', sender: '5551234@s.whatsapp.net', sender_name: 'Alice', content: 'hi', timestamp: 't1', is_from_me: false },
+          {
+            id: 'msg-1',
+            chat_jid: 'registered@g.us',
+            sender: '5551234@s.whatsapp.net',
+            sender_name: 'Alice',
+            content: 'hi',
+            timestamp: 't1',
+            is_from_me: false,
+          },
         ]),
       ).resolves.toBeUndefined();
     });
