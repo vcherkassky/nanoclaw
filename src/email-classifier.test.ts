@@ -139,7 +139,9 @@ describe('classifyEmail', () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'classifier-test-'));
     vi.stubGlobal('fetch', undefined);
     // Default: OLLAMA_HOST set, no model override (auto-detect)
-    vi.mocked(readEnvFile).mockReturnValue({ OLLAMA_HOST: 'http://localhost:11434' });
+    vi.mocked(readEnvFile).mockReturnValue({
+      OLLAMA_HOST: 'http://localhost:11434',
+    });
     // Reset the module-level model cache between tests by reimporting is complex;
     // instead we always supply OLLAMA_CLASSIFIER_MODEL in tests that need it
   });
@@ -150,10 +152,7 @@ describe('classifyEmail', () => {
   });
 
   // Helper: configure env with a fixed model and host
-  function setEnv(
-    model = 'test-model',
-    host = 'http://localhost:11434',
-  ) {
+  function setEnv(model = 'test-model', host = 'http://localhost:11434') {
     vi.mocked(readEnvFile).mockReturnValue({
       OLLAMA_HOST: host,
       OLLAMA_CLASSIFIER_MODEL: model,
@@ -162,7 +161,10 @@ describe('classifyEmail', () => {
 
   it('returns safe: true for a valid SAFE response', async () => {
     setEnv();
-    vi.stubGlobal('fetch', mockOllamaResponse('{"is_safe":true,"reason":"SAFE"}'));
+    vi.stubGlobal(
+      'fetch',
+      mockOllamaResponse('{"is_safe":true,"reason":"SAFE"}'),
+    );
 
     const result = await classifyEmail(makeSanitized());
     expect(result).toEqual({ safe: true });
@@ -179,18 +181,7 @@ describe('classifyEmail', () => {
     expect(result).toMatchObject({ safe: false, reason: 'PROMPT_INJECTION' });
   });
 
-  it('returns safe: false for MALICIOUS_CONTENT verdict', async () => {
-    setEnv();
-    vi.stubGlobal(
-      'fetch',
-      mockOllamaResponse('{"is_safe":false,"reason":"MALICIOUS_CONTENT"}'),
-    );
-
-    const result = await classifyEmail(makeSanitized());
-    expect(result).toMatchObject({ safe: false, reason: 'MALICIOUS_CONTENT' });
-  });
-
-  it('treats UNSURE as unsafe (false-positive bias)', async () => {
+  it('quarantines UNSURE verdict (when in doubt, stay safe)', async () => {
     setEnv();
     vi.stubGlobal(
       'fetch',
@@ -199,6 +190,19 @@ describe('classifyEmail', () => {
 
     const result = await classifyEmail(makeSanitized());
     expect(result).toMatchObject({ safe: false, reason: 'UNSURE' });
+  });
+
+  it('passes through emails with unrecognised reason (e.g. MALICIOUS_CONTENT from old model)', async () => {
+    setEnv();
+    vi.stubGlobal(
+      'fetch',
+      mockOllamaResponse('{"is_safe":false,"reason":"MALICIOUS_CONTENT"}'),
+    );
+
+    // MALICIOUS_CONTENT is no longer in the schema — treated as a classifier
+    // glitch, not a security signal. Gmail spam filter handles malicious content.
+    const result = await classifyEmail(makeSanitized());
+    expect(result).toEqual({ safe: true });
   });
 
   it('returns safe: false when honeypot tool call is detected', async () => {
@@ -219,12 +223,15 @@ describe('classifyEmail', () => {
     expect(result).toMatchObject({ safe: false, type: 'tool_call' });
   });
 
-  it('returns safe: false when response is not valid JSON', async () => {
+  it('passes through when response is not valid JSON (classifier glitch, not security signal)', async () => {
     setEnv();
-    vi.stubGlobal('fetch', mockOllamaResponse('Sorry, I cannot classify this.'));
+    vi.stubGlobal(
+      'fetch',
+      mockOllamaResponse('Sorry, I cannot classify this.'),
+    );
 
     const result = await classifyEmail(makeSanitized());
-    expect(result).toMatchObject({ safe: false, type: 'validation_failure' });
+    expect(result).toEqual({ safe: true });
   });
 
   it('strips markdown code fences before parsing JSON', async () => {
@@ -249,15 +256,15 @@ describe('classifyEmail', () => {
     expect(result).toEqual({ safe: true });
   });
 
-  it('returns safe: false when JSON schema is invalid (missing is_safe)', async () => {
+  it('passes through when JSON schema is invalid (classifier glitch)', async () => {
     setEnv();
     vi.stubGlobal('fetch', mockOllamaResponse('{"reason":"SAFE"}'));
 
     const result = await classifyEmail(makeSanitized());
-    expect(result).toMatchObject({ safe: false, type: 'validation_failure' });
+    expect(result).toEqual({ safe: true });
   });
 
-  it('returns safe: false when reason is not a valid enum value', async () => {
+  it('passes through when reason is not a valid enum value (classifier glitch)', async () => {
     setEnv();
     vi.stubGlobal(
       'fetch',
@@ -265,7 +272,7 @@ describe('classifyEmail', () => {
     );
 
     const result = await classifyEmail(makeSanitized());
-    expect(result).toMatchObject({ safe: false, type: 'validation_failure' });
+    expect(result).toEqual({ safe: true });
   });
 
   it('returns retry: true when Ollama is unreachable', async () => {
@@ -296,7 +303,9 @@ describe('classifyEmail', () => {
 
   it('returns retry: true when no Ollama model is available', async () => {
     // No OLLAMA_CLASSIFIER_MODEL; /api/tags returns empty list
-    vi.mocked(readEnvFile).mockReturnValue({ OLLAMA_HOST: 'http://localhost:11434' });
+    vi.mocked(readEnvFile).mockReturnValue({
+      OLLAMA_HOST: 'http://localhost:11434',
+    });
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
@@ -316,7 +325,12 @@ describe('classifyEmail', () => {
     vi.stubGlobal(
       'fetch',
       mockOllamaResponse('', [
-        { function: { name: 'signal_unsafe', arguments: { reason: 'PROMPT_INJECTION' } } },
+        {
+          function: {
+            name: 'signal_unsafe',
+            arguments: { reason: 'PROMPT_INJECTION' },
+          },
+        },
       ]),
     );
 
@@ -330,23 +344,25 @@ describe('classifyEmail', () => {
     expect(event.type).toBe('tool_call');
   });
 
-  it('writes to quarantine log on validation failure', async () => {
+  it('does NOT write to quarantine log on validation failure (pass-through)', async () => {
     setEnv();
     vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
     vi.stubGlobal('fetch', mockOllamaResponse('not json at all'));
 
-    await classifyEmail(makeSanitized({ id: 'bad-json-id' }));
+    const result = await classifyEmail(makeSanitized({ id: 'bad-json-id' }));
 
+    expect(result).toEqual({ safe: true });
     const logPath = path.join(tmpDir, 'store', 'email-quarantine.jsonl');
-    const event = JSON.parse(fs.readFileSync(logPath, 'utf-8').trim());
-    expect(event.email_id).toBe('bad-json-id');
-    expect(event.type).toBe('validation_failure');
+    expect(fs.existsSync(logPath)).toBe(false);
   });
 
   it('does NOT write to quarantine log for safe emails', async () => {
     setEnv();
     vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
-    vi.stubGlobal('fetch', mockOllamaResponse('{"is_safe":true,"reason":"SAFE"}'));
+    vi.stubGlobal(
+      'fetch',
+      mockOllamaResponse('{"is_safe":true,"reason":"SAFE"}'),
+    );
 
     await classifyEmail(makeSanitized());
 
