@@ -12,7 +12,13 @@ vi.mock('./config.js', () => ({
 }));
 
 vi.mock('./logger.js', () => ({
-  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() },
+  logger: {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    fatal: vi.fn(),
+  },
 }));
 
 vi.mock('./db.js', () => ({
@@ -149,7 +155,11 @@ describe('processGroupMessages — error notification', () => {
     const channel = makeMockChannel();
     _setChannels([channel as any]);
     vi.mocked(findChannel).mockReturnValue(channel as any);
-    vi.mocked(runContainerAgent).mockResolvedValue({ status: 'error', result: null, error: 'timeout' });
+    vi.mocked(runContainerAgent).mockResolvedValue({
+      status: 'error',
+      result: null,
+      error: 'timeout',
+    });
 
     const result = await _processGroupMessages(GROUP_JID);
 
@@ -167,12 +177,18 @@ describe('processGroupMessages — error notification', () => {
     vi.mocked(findChannel).mockReturnValue(channel as any);
 
     // Simulate: streaming callback fires with a result first, then container returns error
-    vi.mocked(runContainerAgent).mockImplementation(async (_group, _input, _register, onOutput) => {
-      if (onOutput) {
-        await onOutput({ status: 'success', result: 'Here is my answer', newSessionId: undefined });
-      }
-      return { status: 'error', result: null, error: 'post-output failure' };
-    });
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _register, onOutput) => {
+        if (onOutput) {
+          await onOutput({
+            status: 'success',
+            result: 'Here is my answer',
+            newSessionId: undefined,
+          });
+        }
+        return { status: 'error', result: null, error: 'post-output failure' };
+      },
+    );
 
     await _processGroupMessages(GROUP_JID);
 
@@ -186,18 +202,24 @@ describe('processGroupMessages — error notification', () => {
     const channel = makeMockChannel();
     _setChannels([channel as any]);
     vi.mocked(findChannel).mockReturnValue(channel as any);
-    vi.mocked(runContainerAgent).mockImplementation(async (_group, _input, _register, onOutput) => {
-      if (onOutput) {
-        await onOutput({ status: 'success', result: 'Done!', newSessionId: undefined });
-      }
-      return { status: 'success', result: 'Done!' };
-    });
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _register, onOutput) => {
+        if (onOutput) {
+          await onOutput({
+            status: 'success',
+            result: 'Done!',
+            newSessionId: undefined,
+          });
+        }
+        return { status: 'success', result: 'Done!' };
+      },
+    );
 
     const result = await _processGroupMessages(GROUP_JID);
 
-    const errorCall = vi.mocked(channel.sendMessage).mock.calls.find(
-      (args) => args[1] === 'Agent error — please try again.',
-    );
+    const errorCall = vi
+      .mocked(channel.sendMessage)
+      .mock.calls.find((args) => args[1] === 'Agent error — please try again.');
     expect(errorCall).toBeUndefined();
     expect(result).toBe(true);
   });

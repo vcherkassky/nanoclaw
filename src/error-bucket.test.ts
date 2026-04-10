@@ -239,7 +239,11 @@ describe('getters', () => {
 describe('clock injection', () => {
   it('uses the injected clock exclusively', () => {
     const clock = makeClock(1_000_000);
-    const bucket = new ErrorBucket({ threshold: 2, windowMs: 60_000, now: clock.now });
+    const bucket = new ErrorBucket({
+      threshold: 2,
+      windowMs: 60_000,
+      now: clock.now,
+    });
     bucket.record(); // recorded at t=1_000_000
     clock.tick(30_000); // advance 30s — first error still in 60s window
     const trigger = bucket.record(); // second error — threshold=2 met

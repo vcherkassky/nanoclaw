@@ -285,7 +285,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Notify the user that the agent failed before sending anything
     await channel
       .sendMessage(chatJid, 'Agent error — please try again.')
-      .catch((err) => logger.warn({ chatJid, err }, 'Failed to send error notification'));
+      .catch((err) =>
+        logger.warn({ chatJid, err }, 'Failed to send error notification'),
+      );
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
@@ -306,7 +308,8 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const noSession = group.containerConfig?.noSession === true;
+  const sessionId = noSession ? undefined : sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -336,7 +339,7 @@ async function runAgent(
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
+        if (!noSession && output.newSessionId) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -360,7 +363,7 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId) {
+    if (!noSession && output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }

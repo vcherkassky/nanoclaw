@@ -173,7 +173,10 @@ export class GroupQueue {
       fs.renameSync(tempPath, filepath);
       return true;
     } catch (err) {
-      logger.error({ groupJid, err }, 'GroupQueue: failed to write IPC message');
+      logger.error(
+        { groupJid, err },
+        'GroupQueue: failed to write IPC message',
+      );
       return false;
     }
   }

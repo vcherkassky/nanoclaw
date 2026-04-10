@@ -30,6 +30,7 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  noSession?: boolean; // If true, never persist or resume a session for this group
 }
 
 export interface RegisteredGroup {

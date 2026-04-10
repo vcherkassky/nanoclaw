@@ -146,8 +146,12 @@ export class GmailChannel implements Channel {
     if (this.opts.useClassifier) {
       setTimeout(() => {
         this.pollForMessages()
-          .catch((err) => logger.error({ err }, 'Gmail monitor: initial poll error'))
-          .finally(() => { if (this.gmail) schedulePoll(); });
+          .catch((err) =>
+            logger.error({ err }, 'Gmail monitor: initial poll error'),
+          )
+          .finally(() => {
+            if (this.gmail) schedulePoll();
+          });
       }, 30_000);
     } else {
       await this.pollForMessages();
@@ -265,7 +269,10 @@ export class GmailChannel implements Channel {
         (err as any)?.response?.status ??
         (err as any)?.status ??
         (err as any)?.code;
-      if ((status === 401 || status === 403) && !this.reauthInProgress) {
+      const isInvalidGrant =
+        (err as any)?.response?.data?.error === 'invalid_grant' ||
+        (err as any)?.message === 'invalid_grant';
+      if ((status === 401 || status === 403 || isInvalidGrant) && !this.reauthInProgress) {
         logger.error(
           { err },
           'Gmail auth error detected, starting re-auth flow',
@@ -496,7 +503,10 @@ export class GmailChannel implements Channel {
     if (this.opts.useClassifier) {
       const sanitized = sanitizeEmail(messageId, senderEmail, subject, body);
       if (!sanitized) {
-        logger.warn({ messageId, senderEmail }, 'Gmail: email failed sanitization, skipping');
+        logger.warn(
+          { messageId, senderEmail },
+          'Gmail: email failed sanitization, skipping',
+        );
         const trigger = this.errorBucket?.record();
         if (trigger) {
           if (trigger.suppressed) {
@@ -505,10 +515,17 @@ export class GmailChannel implements Channel {
               'Gmail Monitor: daily error notification cap reached — errors are being silently dropped',
             );
           } else {
-            await this.opts.sendNotification?.(
-              `⚠️ Gmail Monitor: ${trigger.count} classifier errors in the last hour\nFrom: ${shortFrom} | Subj: ${shortSubject}\nCause: sanitization failure`,
-              this.opts.targetJid,
-            ).catch((err) => logger.error({ err }, 'Gmail: failed to send error notification'));
+            await this.opts
+              .sendNotification?.(
+                `⚠️ Gmail Monitor: ${trigger.count} classifier errors in the last hour\nFrom: ${shortFrom} | Subj: ${shortSubject}\nCause: sanitization failure`,
+                this.opts.targetJid,
+              )
+              .catch((err) =>
+                logger.error(
+                  { err },
+                  'Gmail: failed to send error notification',
+                ),
+              );
           }
         }
         return;
@@ -531,21 +548,32 @@ export class GmailChannel implements Channel {
               'Gmail Monitor: daily error notification cap reached — errors are being silently dropped',
             );
           } else {
-            await this.opts.sendNotification?.(
-              `⚠️ Gmail Monitor: ${trigger.count} classifier errors in the last hour\nFrom: ${shortFrom} | Subj: ${shortSubject}\nCause: ${classification.reason}`,
-              this.opts.targetJid,
-            ).catch((err) => logger.error({ err }, 'Gmail: failed to send error notification'));
+            await this.opts
+              .sendNotification?.(
+                `⚠️ Gmail Monitor: ${trigger.count} classifier errors in the last hour\nFrom: ${shortFrom} | Subj: ${shortSubject}\nCause: ${classification.reason}`,
+                this.opts.targetJid,
+              )
+              .catch((err) =>
+                logger.error(
+                  { err },
+                  'Gmail: failed to send error notification',
+                ),
+              );
           }
         }
         return; // do NOT apply label or mark as read
       }
 
       if (!classification.safe) {
-        const notifMsg =
-          `⚠️ Quarantined\nFrom: ${shortFrom} | Subj: ${shortSubject}\nReason: ${classification.reason}`;
-        await this.opts.sendNotification?.(notifMsg, this.opts.targetJid).catch((err) =>
-          logger.error({ err }, 'Gmail: failed to send quarantine notification'),
-        );
+        const notifMsg = `⚠️ Quarantined\nFrom: ${shortFrom} | Subj: ${shortSubject}\nReason: ${classification.reason}`;
+        await this.opts
+          .sendNotification?.(notifMsg, this.opts.targetJid)
+          .catch((err) =>
+            logger.error(
+              { err },
+              'Gmail: failed to send quarantine notification',
+            ),
+          );
         quarantined = true;
         // Fall through to tracking section
       }
@@ -567,7 +595,9 @@ export class GmailChannel implements Channel {
 
     // Track processing: label (monitor channel) or mark-as-read (PA channel)
     if (this.opts.labelTracking) {
-      const labelId = quarantined ? this.quarantinedLabelId : this.processedLabelId;
+      const labelId = quarantined
+        ? this.quarantinedLabelId
+        : this.processedLabelId;
       if (labelId) {
         try {
           await this.gmail.users.messages.modify({
@@ -576,7 +606,10 @@ export class GmailChannel implements Channel {
             requestBody: { addLabelIds: [labelId] },
           });
         } catch (err) {
-          logger.warn({ messageId, err }, 'Gmail: failed to apply tracking label — will retry on next poll');
+          logger.warn(
+            { messageId, err },
+            'Gmail: failed to apply tracking label — will retry on next poll',
+          );
           this.processedIds.delete(messageId);
         }
       }
@@ -644,7 +677,10 @@ export class GmailChannel implements Channel {
 
     if (fs.existsSync(filePath)) {
       this.startDate = fs.readFileSync(filePath, 'utf-8').trim();
-      logger.info({ startDate: this.startDate }, 'Gmail Monitor: loaded start date cursor');
+      logger.info(
+        { startDate: this.startDate },
+        'Gmail Monitor: loaded start date cursor',
+      );
       return;
     }
 

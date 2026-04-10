@@ -181,6 +181,9 @@ export async function classifyEmail(
     return { retry: true, reason: 'No Ollama model available' };
   }
 
+  const startMs = Date.now();
+  const elapsed = () => Date.now() - startMs;
+
   const userContent = `From: ${email.from}\nSubject: ${email.subject}\n\n${email.body}`;
 
   const requestBody = {
@@ -230,8 +233,17 @@ export async function classifyEmail(
       err instanceof Error && err.name === 'TimeoutError'
         ? 'Classifier request timed out'
         : `Ollama unreachable: ${err instanceof Error ? err.message : String(err)}`;
+    const systemChars = SANDBOX_PROMPT.length;
+    const userChars = userContent.length;
     logger.warn(
-      { emailId: email.id, reason },
+      {
+        emailId: email.id,
+        elapsedMs: elapsed(),
+        reason,
+        systemChars,
+        userChars,
+        estimatedTokens: Math.round((systemChars + userChars) / 4),
+      },
       'Email classifier: transient error',
     );
     return { retry: true, reason };
@@ -240,7 +252,7 @@ export async function classifyEmail(
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     logger.warn(
-      { emailId: email.id, status: response.status, text },
+      { emailId: email.id, elapsedMs: elapsed(), status: response.status, text },
       'Email classifier: Ollama API error',
     );
     return { retry: true, reason: `Ollama API error: ${response.status}` };
@@ -257,7 +269,7 @@ export async function classifyEmail(
   } catch {
     // Can't parse Ollama's response envelope — not a security signal. Pass through.
     logger.warn(
-      { emailId: email.id },
+      { emailId: email.id, elapsedMs: elapsed() },
       'Email classifier: non-JSON response from Ollama — passing email through',
     );
     return { safe: true };
@@ -267,7 +279,7 @@ export async function classifyEmail(
   if (data.message?.tool_calls && data.message.tool_calls.length > 0) {
     const toolName = data.message.tool_calls[0]?.function?.name ?? 'unknown';
     logger.warn(
-      { emailId: email.id, tool: toolName },
+      { emailId: email.id, elapsedMs: elapsed(), tool: toolName },
       'Email classifier: honeypot triggered — tool call detected',
     );
     appendQuarantineLog({
@@ -305,7 +317,7 @@ export async function classifyEmail(
   } catch {
     // Classifier output glitch — not a security signal. Pass through.
     logger.warn(
-      { emailId: email.id, raw },
+      { emailId: email.id, elapsedMs: elapsed(), raw },
       'Email classifier: output is not valid JSON — passing email through',
     );
     return { safe: true };
@@ -315,7 +327,7 @@ export async function classifyEmail(
   if (!result.success) {
     // Schema mismatch — not a security signal. Pass through.
     logger.warn(
-      { emailId: email.id, parsed, errors: result.error.issues },
+      { emailId: email.id, elapsedMs: elapsed(), parsed, errors: result.error.issues },
       'Email classifier: output failed schema validation — passing email through',
     );
     return { safe: true };
@@ -323,10 +335,14 @@ export async function classifyEmail(
 
   const verdict = result.data;
 
-  if (!verdict.is_safe || verdict.reason === 'PROMPT_INJECTION' || verdict.reason === 'UNSURE') {
+  if (
+    !verdict.is_safe ||
+    verdict.reason === 'PROMPT_INJECTION' ||
+    verdict.reason === 'UNSURE'
+  ) {
     const reason = verdict.reason;
     logger.info(
-      { emailId: email.id, reason },
+      { emailId: email.id, elapsedMs: elapsed(), reason },
       'Email classifier: prompt injection detected, quarantining',
     );
     appendQuarantineLog({
@@ -339,6 +355,6 @@ export async function classifyEmail(
     return { safe: false, reason, type: 'classifier_verdict' };
   }
 
-  logger.debug({ emailId: email.id }, 'Email classifier: safe');
+  logger.debug({ emailId: email.id, elapsedMs: elapsed() }, 'Email classifier: safe');
   return { safe: true };
 }
