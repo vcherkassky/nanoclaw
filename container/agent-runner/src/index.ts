@@ -18,6 +18,9 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { buildDump, estimateTokens, probeSchemas, type ComponentEntry, type McpServerConfig } from './context-dump.js';
+
+const CONTEXT_DUMP = process.env.NANOCLAW_CONTEXT_DUMP === '1';
 
 interface ContainerInput {
   prompt: string;
@@ -395,6 +398,45 @@ async function runQuery(
   const baseUrl = process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
   log(`[CONFIG] model=${modelName} upstream=${baseUrl}`);
 
+  const mcpServers: Record<string, McpServerConfig> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+    ...(process.env.LINEAR_API_KEY ? {
+      linear: {
+        command: 'node',
+        args: [path.join(path.dirname(mcpServerPath), 'linear-mcp-stdio.js')],
+        env: { LINEAR_API_KEY: process.env.LINEAR_API_KEY },
+      },
+    } : {}),
+    gmail: {
+      command: 'npx',
+      args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+    },
+  };
+
+  // Context dump: probe MCP schemas before the query (only when flag is set)
+  let dumpMcpComponents: Record<string, ComponentEntry> = {};
+  if (CONTEXT_DUMP) {
+    log('[context-dump] probing MCP schemas...');
+    dumpMcpComponents = await probeSchemas(mcpServers, log);
+  }
+
+  // Context dump: capture SDK init and result message data
+  let dumpModelResolved: string | null = null;
+  let dumpContextWindow: number | null = null;
+  let dumpMaxOutputTokens: number | null = null;
+  let dumpInputTokens = 0;
+  let dumpOutputTokens = 0;
+  let dumpCostUsd: number | null = null;
+  let dumpDurationMs: number | null = null;
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -421,28 +463,7 @@ async function runQuery(
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-        ...(process.env.LINEAR_API_KEY ? {
-          linear: {
-            command: 'node',
-            args: [path.join(path.dirname(mcpServerPath), 'linear-mcp-stdio.js')],
-            env: { LINEAR_API_KEY: process.env.LINEAR_API_KEY },
-          },
-        } : {}),
-        gmail: {
-          command: 'npx',
-          args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
-        },
-      },
+      mcpServers,
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
@@ -459,6 +480,9 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      if (CONTEXT_DUMP) {
+        dumpModelResolved = (message as unknown as { model?: string }).model ?? null;
+      }
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -473,6 +497,8 @@ async function runQuery(
         subtype?: string;
         total_cost_usd?: number;
         usage?: Record<string, number>;
+        duration_ms?: number;
+        model_usage?: Record<string, { context_window?: number; max_output_tokens?: number }>;
       };
       const textResult = res.result ?? null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
@@ -483,11 +509,63 @@ async function runQuery(
         usage: res.usage,
         costUsd: res.total_cost_usd,
       });
+      if (CONTEXT_DUMP) {
+        dumpInputTokens += res.usage?.input_tokens ?? 0;
+        dumpOutputTokens += res.usage?.output_tokens ?? 0;
+        dumpCostUsd = (dumpCostUsd ?? 0) + (res.total_cost_usd ?? 0);
+        dumpDurationMs = res.duration_ms ?? null;
+        // Extract context window from modelUsage (keyed by resolved model name)
+        if (res.model_usage) {
+          const modelEntry = dumpModelResolved ? res.model_usage[dumpModelResolved] : undefined;
+          const firstEntry = Object.values(res.model_usage)[0];
+          const entry = modelEntry ?? firstEntry;
+          if (entry) {
+            dumpContextWindow = entry.context_window ?? null;
+            dumpMaxOutputTokens = entry.max_output_tokens ?? null;
+          }
+        }
+      }
     }
   }
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
+
+  if (CONTEXT_DUMP) {
+    const components: Record<string, ComponentEntry> = {
+      user_message: {
+        chars: prompt.length,
+        est_tokens: estimateTokens(prompt.length),
+      },
+      ...(globalClaudeMd ? {
+        claude_md: {
+          chars: globalClaudeMd.length,
+          est_tokens: estimateTokens(globalClaudeMd.length),
+        },
+      } : {}),
+      ...dumpMcpComponents,
+    };
+    const dump = buildDump({
+      group: containerInput.groupFolder,
+      modelConfigured: modelName,
+      modelResolved: dumpModelResolved,
+      contextWindow: dumpContextWindow,
+      maxOutputTokens: dumpMaxOutputTokens,
+      components,
+      inputTokens: dumpInputTokens,
+      outputTokens: dumpOutputTokens,
+      costUsd: dumpCostUsd,
+      durationMs: dumpDurationMs,
+    });
+    const dumpTs = new Date().toISOString().replace(/[:.]/g, '-');
+    const dumpPath = `/workspace/group/context-dump-${dumpTs}.json`;
+    try {
+      fs.writeFileSync(dumpPath, JSON.stringify(dump, null, 2) + '\n');
+      log(`[context-dump] written to ${dumpPath}`);
+    } catch (err) {
+      log(`[context-dump] failed to write dump: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 

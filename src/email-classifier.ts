@@ -252,7 +252,12 @@ export async function classifyEmail(
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     logger.warn(
-      { emailId: email.id, elapsedMs: elapsed(), status: response.status, text },
+      {
+        emailId: email.id,
+        elapsedMs: elapsed(),
+        status: response.status,
+        text,
+      },
       'Email classifier: Ollama API error',
     );
     return { retry: true, reason: `Ollama API error: ${response.status}` };
@@ -327,7 +332,12 @@ export async function classifyEmail(
   if (!result.success) {
     // Schema mismatch — not a security signal. Pass through.
     logger.warn(
-      { emailId: email.id, elapsedMs: elapsed(), parsed, errors: result.error.issues },
+      {
+        emailId: email.id,
+        elapsedMs: elapsed(),
+        parsed,
+        errors: result.error.issues,
+      },
       'Email classifier: output failed schema validation — passing email through',
     );
     return { safe: true };
@@ -355,6 +365,9 @@ export async function classifyEmail(
     return { safe: false, reason, type: 'classifier_verdict' };
   }
 
-  logger.debug({ emailId: email.id, elapsedMs: elapsed() }, 'Email classifier: safe');
+  logger.debug(
+    { emailId: email.id, elapsedMs: elapsed() },
+    'Email classifier: safe',
+  );
   return { safe: true };
 }

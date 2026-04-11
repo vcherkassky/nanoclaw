@@ -272,7 +272,10 @@ export class GmailChannel implements Channel {
       const isInvalidGrant =
         (err as any)?.response?.data?.error === 'invalid_grant' ||
         (err as any)?.message === 'invalid_grant';
-      if ((status === 401 || status === 403 || isInvalidGrant) && !this.reauthInProgress) {
+      if (
+        (status === 401 || status === 403 || isInvalidGrant) &&
+        !this.reauthInProgress
+      ) {
         logger.error(
           { err },
           'Gmail auth error detected, starting re-auth flow',
