@@ -184,6 +184,8 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'queries'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'query-results'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -256,7 +258,10 @@ function buildContainerArgs(
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
-  const { ANTHROPIC_MODEL, NANOCLAW_CONTEXT_DUMP } = readEnvFile(['ANTHROPIC_MODEL', 'NANOCLAW_CONTEXT_DUMP']);
+  const { ANTHROPIC_MODEL, NANOCLAW_CONTEXT_DUMP } = readEnvFile([
+    'ANTHROPIC_MODEL',
+    'NANOCLAW_CONTEXT_DUMP',
+  ]);
   if (ANTHROPIC_MODEL) {
     args.push('-e', `ANTHROPIC_MODEL=${ANTHROPIC_MODEL}`);
   }

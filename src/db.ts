@@ -363,6 +363,25 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
 }
 
+export function getRecentMessages(
+  chatJid: string,
+  limit: number = 20,
+  since: string = '1970-01-01T00:00:00.000Z',
+): NewMessage[] {
+  return db
+    .prepare(
+      `SELECT * FROM (
+         SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+         FROM messages
+         WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
+           AND timestamp > ?
+         ORDER BY timestamp DESC
+         LIMIT ?
+       ) ORDER BY timestamp`,
+    )
+    .all(chatJid, since, limit) as NewMessage[];
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {

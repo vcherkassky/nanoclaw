@@ -144,8 +144,9 @@ export function appendQuarantineLog(event: {
 let _cachedModel: string | null = null;
 
 async function resolveModel(ollamaHost: string): Promise<string | null> {
-  const env = readEnvFile(['OLLAMA_CLASSIFIER_MODEL']);
+  const env = readEnvFile(['OLLAMA_CLASSIFIER_MODEL', 'ANTHROPIC_MODEL']);
   if (env.OLLAMA_CLASSIFIER_MODEL) return env.OLLAMA_CLASSIFIER_MODEL;
+  if (env.ANTHROPIC_MODEL) return env.ANTHROPIC_MODEL;
 
   if (_cachedModel) return _cachedModel;
 

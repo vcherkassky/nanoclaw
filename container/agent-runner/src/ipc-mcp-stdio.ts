@@ -14,6 +14,8 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const QUERIES_DIR = path.join(IPC_DIR, 'queries');
+const QUERY_RESULTS_DIR = path.join(IPC_DIR, 'query-results');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -294,6 +296,86 @@ server.tool(
     writeIpcFile(TASKS_DIR, data);
 
     return { content: [{ type: 'text' as const, text: `Task ${args.task_id} update requested.` }] };
+  },
+);
+
+server.tool(
+  'get_messages',
+  `Fetch recent messages from this group's chat history. Useful when you need context about prior conversations that aren't in your current session.
+
+Returns messages in chronological order, formatted as "[HH:MM:SS] SenderName: content".`,
+  {
+    limit: z.number().int().min(1).max(100).default(20).describe('Number of recent messages to fetch (max 100)'),
+    since: z.string().optional().describe('ISO 8601 timestamp — only return messages after this time (e.g. "2026-04-01T00:00:00.000Z")'),
+  },
+  async (args) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const request = {
+      type: 'get_messages',
+      requestId,
+      chatJid,
+      limit: args.limit ?? 20,
+      since: args.since ?? '1970-01-01T00:00:00.000Z',
+    };
+
+    // Write request file
+    fs.mkdirSync(QUERIES_DIR, { recursive: true });
+    const requestPath = path.join(QUERIES_DIR, `${requestId}.json`);
+    const tempPath = `${requestPath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(request, null, 2));
+    fs.renameSync(tempPath, requestPath);
+
+    // Poll for result (200ms interval, 10s timeout)
+    const resultPath = path.join(QUERY_RESULTS_DIR, `${requestId}.json`);
+    const timeoutMs = 10_000;
+    const pollIntervalMs = 200;
+    const deadline = Date.now() + timeoutMs;
+
+    const pollResult = await new Promise<{ messages: Array<{ sender_name: string; content: string; timestamp: string; is_from_me: number }> } | null>((resolve) => {
+      const poll = () => {
+        if (fs.existsSync(resultPath)) {
+          try {
+            const data = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+            try { fs.unlinkSync(resultPath); } catch { /* ignore */ }
+            resolve(data);
+          } catch {
+            resolve(null);
+          }
+          return;
+        }
+        if (Date.now() >= deadline) {
+          // Timed out — clean up stale request file if still present
+          try { fs.unlinkSync(requestPath); } catch { /* ignore */ }
+          resolve(null);
+          return;
+        }
+        setTimeout(poll, pollIntervalMs);
+      };
+      setTimeout(poll, pollIntervalMs);
+    });
+
+    if (!pollResult) {
+      return {
+        content: [{ type: 'text' as const, text: 'get_messages timed out waiting for host response.' }],
+        isError: true,
+      };
+    }
+
+    const messages = pollResult.messages ?? [];
+    if (messages.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No messages found.' }] };
+    }
+
+    const formatted = messages
+      .map((m) => {
+        const ts = new Date(m.timestamp);
+        const hms = `${String(ts.getHours()).padStart(2, '0')}:${String(ts.getMinutes()).padStart(2, '0')}:${String(ts.getSeconds()).padStart(2, '0')}`;
+        const sender = m.is_from_me ? 'Me' : (m.sender_name || 'Unknown');
+        return `[${hms}] ${sender}: ${m.content}`;
+      })
+      .join('\n');
+
+    return { content: [{ type: 'text' as const, text: formatted }] };
   },
 );
 

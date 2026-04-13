@@ -228,6 +228,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.markRead?.(chatJid, missedMessages);
   let hadError = false;
   let outputSentToUser = false;
+  const agentStartMs = Date.now();
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -239,6 +240,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       if (result.usage || result.costUsd !== undefined) {
+        const elapsedMs = Date.now() - agentStartMs;
         logger.info(
           {
             group: group.name,
@@ -247,6 +249,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               result.costUsd !== undefined
                 ? +result.costUsd.toFixed(4)
                 : undefined,
+            latencyMs: elapsedMs,
           },
           'Token usage',
         );
