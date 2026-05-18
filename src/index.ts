@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import type { ChildProcess } from 'child_process';
 
 import {
   ASSISTANT_NAME,
@@ -71,6 +72,7 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 let emailProcessorChain = Promise.resolve();
+const activeHeadlessContainers = new Set<ChildProcess>();
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -417,6 +419,26 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
     requiresTrigger: false,
   };
 
+  writeTasksSnapshot(
+    'pa_email_processor',
+    false,
+    getAllTasks().map((t) => ({
+      id: t.id,
+      groupFolder: t.group_folder,
+      prompt: t.prompt,
+      schedule_type: t.schedule_type,
+      schedule_value: t.schedule_value,
+      status: t.status,
+      next_run: t.next_run,
+    })),
+  );
+  writeGroupsSnapshot(
+    'pa_email_processor',
+    false,
+    getAvailableGroups(),
+    new Set(Object.keys(registeredGroups)),
+  );
+
   const outputChunks: string[] = [];
   const groupIpcDir = resolveGroupIpcPath('pa_email_processor');
   const closeFile = path.join(groupIpcDir, 'input', '_close');
@@ -431,8 +453,10 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
       isMain: false,
       assistantName: ASSISTANT_NAME,
     },
-    (_proc, containerName) => {
+    (proc, containerName) => {
       logger.debug({ containerName }, 'Email processor container started');
+      activeHeadlessContainers.add(proc);
+      proc.once('exit', () => activeHeadlessContainers.delete(proc));
     },
     async (output) => {
       if (output.result) {
@@ -619,6 +643,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    for (const proc of activeHeadlessContainers) proc.kill('SIGTERM');
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
