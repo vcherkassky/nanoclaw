@@ -1,5 +1,6 @@
 import {
   Channel,
+  NewMessage,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
@@ -10,6 +11,7 @@ export interface ChannelOpts {
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
   sendNotification?: (text: string, jid?: string) => Promise<void>;
+  onEmailForProcessing?: (msg: NewMessage) => Promise<void>;
 }
 
 export type ChannelFactory = (opts: ChannelOpts) => Channel | null;

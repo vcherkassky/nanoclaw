@@ -6,6 +6,7 @@ import {
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  PUBLIC_INBOX_TARGET_JID,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -69,6 +70,7 @@ let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+let emailProcessorChain = Promise.resolve();
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -386,6 +388,73 @@ async function runAgent(
   }
 }
 
+async function processEmailHeadless(msg: NewMessage): Promise<void> {
+  const targetJid = PUBLIC_INBOX_TARGET_JID;
+  if (!targetJid) {
+    logger.warn('processEmailHeadless: PUBLIC_INBOX_TARGET_JID not set, skipping');
+    return;
+  }
+
+  const emailProcessorGroup: RegisteredGroup = {
+    name: 'pa_email_processor',
+    folder: 'pa_email_processor',
+    trigger: '',
+    added_at: '',
+    containerConfig: {
+      noSession: true,
+      timeout: 600000,
+      idleTimeoutMs: 0,
+      additionalMounts: [
+        { hostPath: '/Users/viktor/Documents/Knowledge Base', containerPath: 'kb', readonly: false },
+      ],
+    },
+    requiresTrigger: false,
+  };
+
+  const outputChunks: string[] = [];
+  const result = await runContainerAgent(
+    emailProcessorGroup,
+    {
+      prompt: msg.content,
+      groupFolder: 'pa_email_processor',
+      chatJid: targetJid,
+      isMain: false,
+      assistantName: ASSISTANT_NAME,
+    },
+    (_proc, containerName) => {
+      logger.debug({ containerName }, 'Email processor container started');
+    },
+    async (output) => {
+      if (output.result) {
+        const raw =
+          typeof output.result === 'string'
+            ? output.result
+            : JSON.stringify(output.result);
+        outputChunks.push(raw);
+      }
+    },
+  );
+
+  if (result.status === 'error') {
+    logger.error({ error: result.error }, 'Email processor container error');
+    throw new Error(result.error ?? 'Email processor failed');
+  }
+
+  const fullOutput = outputChunks.join('');
+  const notifyMatch = fullOutput.match(/<notify>([\s\S]*?)<\/notify>/);
+  if (notifyMatch) {
+    const notifyText = notifyMatch[1].trim();
+    if (notifyText) {
+      const channel = findChannel(channels, targetJid);
+      if (channel) {
+        await channel.sendMessage(targetJid, notifyText);
+      } else {
+        logger.warn({ targetJid }, 'Email processor: no channel for target JID');
+      }
+    }
+  }
+}
+
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');
@@ -578,6 +647,16 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
+    onEmailForProcessing: (msg: NewMessage): Promise<void> => {
+      const slot = emailProcessorChain.then(() =>
+        processEmailHeadless(msg).catch((err) => {
+          logger.error({ err }, 'Email processor error');
+          throw err;
+        }),
+      );
+      emailProcessorChain = slot.catch(() => {}); // chain survives failures
+      return slot;
+    },
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
       const trimmed = msg.content.trim();

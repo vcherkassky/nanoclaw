@@ -443,9 +443,12 @@ export async function runContainerAgent(
     let timedOut = false;
     let hadStreamingOutput = false;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
+    // Grace period: hard timeout must be at least idleTimeoutMs + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+    // Headless containers (no GroupQueue idle timer) can set idleTimeoutMs: 0
+    // to skip the grace period and use configTimeout directly.
+    const effectiveIdleTimeout = group.containerConfig?.idleTimeoutMs ?? IDLE_TIMEOUT;
+    const timeoutMs = Math.max(configTimeout, effectiveIdleTimeout + 30_000);
 
     const killOnTimeout = () => {
       timedOut = true;

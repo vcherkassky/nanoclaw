@@ -487,10 +487,27 @@ describe('registered group isMain', () => {
 // --- getRecentMessages ---
 
 describe('getRecentMessages', () => {
-  function seed(chatJid: string, messages: Array<{ id: string; content: string; timestamp: string; is_from_me?: boolean; sender_name?: string }>) {
+  function seed(
+    chatJid: string,
+    messages: Array<{
+      id: string;
+      content: string;
+      timestamp: string;
+      is_from_me?: boolean;
+      sender_name?: string;
+    }>,
+  ) {
     storeChatMetadata(chatJid, messages[0].timestamp);
     for (const m of messages) {
-      store({ id: m.id, chat_jid: chatJid, sender: `${m.id}@s.whatsapp.net`, sender_name: m.sender_name ?? 'Alice', content: m.content, timestamp: m.timestamp, is_from_me: m.is_from_me });
+      store({
+        id: m.id,
+        chat_jid: chatJid,
+        sender: `${m.id}@s.whatsapp.net`,
+        sender_name: m.sender_name ?? 'Alice',
+        content: m.content,
+        timestamp: m.timestamp,
+        is_from_me: m.is_from_me,
+      });
     }
   }
 
@@ -520,7 +537,11 @@ describe('getRecentMessages', () => {
       { id: 'a', content: 'before', timestamp: '2024-01-01T09:59:59.000Z' },
       { id: 'b', content: 'after', timestamp: '2024-01-01T10:00:01.000Z' },
     ]);
-    const msgs = getRecentMessages('group@g.us', 20, '2024-01-01T10:00:00.000Z');
+    const msgs = getRecentMessages(
+      'group@g.us',
+      20,
+      '2024-01-01T10:00:00.000Z',
+    );
     expect(msgs).toHaveLength(1);
     expect(msgs[0].content).toBe('after');
   });
@@ -536,16 +557,34 @@ describe('getRecentMessages', () => {
 
   it('filters out empty content', () => {
     storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
-    store({ id: 'x', chat_jid: 'group@g.us', sender: 'x@s.whatsapp.net', sender_name: 'Bob', content: '', timestamp: '2024-01-01T10:00:00.000Z' });
-    store({ id: 'y', chat_jid: 'group@g.us', sender: 'y@s.whatsapp.net', sender_name: 'Bob', content: 'visible', timestamp: '2024-01-01T10:00:01.000Z' });
+    store({
+      id: 'x',
+      chat_jid: 'group@g.us',
+      sender: 'x@s.whatsapp.net',
+      sender_name: 'Bob',
+      content: '',
+      timestamp: '2024-01-01T10:00:00.000Z',
+    });
+    store({
+      id: 'y',
+      chat_jid: 'group@g.us',
+      sender: 'y@s.whatsapp.net',
+      sender_name: 'Bob',
+      content: 'visible',
+      timestamp: '2024-01-01T10:00:01.000Z',
+    });
     const msgs = getRecentMessages('group@g.us');
     expect(msgs).toHaveLength(1);
     expect(msgs[0].content).toBe('visible');
   });
 
   it('only returns messages from the requested chatJid', () => {
-    seed('group-a@g.us', [{ id: 'a1', content: 'from A', timestamp: '2024-01-01T10:00:00.000Z' }]);
-    seed('group-b@g.us', [{ id: 'b1', content: 'from B', timestamp: '2024-01-01T10:00:00.000Z' }]);
+    seed('group-a@g.us', [
+      { id: 'a1', content: 'from A', timestamp: '2024-01-01T10:00:00.000Z' },
+    ]);
+    seed('group-b@g.us', [
+      { id: 'b1', content: 'from B', timestamp: '2024-01-01T10:00:00.000Z' },
+    ]);
     const msgs = getRecentMessages('group-a@g.us');
     expect(msgs).toHaveLength(1);
     expect(msgs[0].content).toBe('from A');
@@ -553,8 +592,18 @@ describe('getRecentMessages', () => {
 
   it('preserves is_from_me flag', () => {
     seed('group@g.us', [
-      { id: 'a', content: 'from me', timestamp: '2024-01-01T10:00:00.000Z', is_from_me: true },
-      { id: 'b', content: 'from them', timestamp: '2024-01-01T10:00:01.000Z', is_from_me: false },
+      {
+        id: 'a',
+        content: 'from me',
+        timestamp: '2024-01-01T10:00:00.000Z',
+        is_from_me: true,
+      },
+      {
+        id: 'b',
+        content: 'from them',
+        timestamp: '2024-01-01T10:00:01.000Z',
+        is_from_me: false,
+      },
     ]);
     const msgs = getRecentMessages('group@g.us');
     expect(msgs[0].is_from_me).toBeTruthy();

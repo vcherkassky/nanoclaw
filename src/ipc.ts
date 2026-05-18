@@ -5,7 +5,13 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getRecentMessages, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getRecentMessages,
+  getTaskById,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -63,7 +69,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
       const queriesDir = path.join(ipcBaseDir, sourceGroup, 'queries');
-      const queryResultsDir = path.join(ipcBaseDir, sourceGroup, 'query-results');
+      const queryResultsDir = path.join(
+        ipcBaseDir,
+        sourceGroup,
+        'query-results',
+      );
 
       // Process messages from this group's IPC directory
       try {
@@ -157,23 +167,48 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(queriesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'get_messages' && data.requestId && data.chatJid) {
+              if (
+                data.type === 'get_messages' &&
+                data.requestId &&
+                data.chatJid
+              ) {
                 // Authorization: non-main groups can only query their own chatJid
-                const registeredGroup = registeredGroups[data.chatJid as string];
+                const registeredGroup =
+                  registeredGroups[data.chatJid as string];
                 const authorized =
                   isMain ||
                   (registeredGroup && registeredGroup.folder === sourceGroup);
                 if (authorized) {
-                  const limit = typeof data.limit === 'number' ? Math.min(data.limit, 100) : 20;
-                  const since = typeof data.since === 'string' ? data.since : '1970-01-01T00:00:00.000Z';
-                  const messages = getRecentMessages(data.chatJid as string, limit, since);
+                  const limit =
+                    typeof data.limit === 'number'
+                      ? Math.min(data.limit, 100)
+                      : 20;
+                  const since =
+                    typeof data.since === 'string'
+                      ? data.since
+                      : '1970-01-01T00:00:00.000Z';
+                  const messages = getRecentMessages(
+                    data.chatJid as string,
+                    limit,
+                    since,
+                  );
                   fs.mkdirSync(queryResultsDir, { recursive: true });
-                  const resultPath = path.join(queryResultsDir, `${data.requestId as string}.json`);
+                  const resultPath = path.join(
+                    queryResultsDir,
+                    `${data.requestId as string}.json`,
+                  );
                   const tempPath = `${resultPath}.tmp`;
-                  fs.writeFileSync(tempPath, JSON.stringify({ messages }, null, 2));
+                  fs.writeFileSync(
+                    tempPath,
+                    JSON.stringify({ messages }, null, 2),
+                  );
                   fs.renameSync(tempPath, resultPath);
                   logger.debug(
-                    { requestId: data.requestId, sourceGroup, count: messages.length },
+                    {
+                      requestId: data.requestId,
+                      sourceGroup,
+                      count: messages.length,
+                    },
                     'IPC get_messages query fulfilled',
                   );
                 } else {
@@ -183,21 +218,41 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   );
                   // Write empty result so the container doesn't hang
                   fs.mkdirSync(queryResultsDir, { recursive: true });
-                  const resultPath = path.join(queryResultsDir, `${data.requestId as string}.json`);
+                  const resultPath = path.join(
+                    queryResultsDir,
+                    `${data.requestId as string}.json`,
+                  );
                   const tempPath = `${resultPath}.tmp`;
-                  fs.writeFileSync(tempPath, JSON.stringify({ messages: [], error: 'unauthorized' }, null, 2));
+                  fs.writeFileSync(
+                    tempPath,
+                    JSON.stringify(
+                      { messages: [], error: 'unauthorized' },
+                      null,
+                      2,
+                    ),
+                  );
                   fs.renameSync(tempPath, resultPath);
                 }
               }
               fs.unlinkSync(filePath);
             } catch (err) {
-              logger.error({ file, sourceGroup, err }, 'Error processing IPC query');
-              try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC query',
+              );
+              try {
+                fs.unlinkSync(filePath);
+              } catch {
+                /* ignore */
+              }
             }
           }
         }
       } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading IPC queries directory');
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC queries directory',
+        );
       }
     }
 

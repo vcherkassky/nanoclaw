@@ -16,16 +16,20 @@ groups/*
 !groups/whatsapp_main/
 !groups/slack_main/
 !groups/whatsapp_gmail/
+!groups/pa_inbox_monitor/
 groups/main/*
 groups/global/*
 groups/whatsapp_main/*
 groups/slack_main/*
 groups/whatsapp_gmail/*
+groups/pa_inbox_monitor/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 !groups/whatsapp_main/CLAUDE.md
 !groups/slack_main/CLAUDE.md
 !groups/whatsapp_gmail/CLAUDE.md
+!groups/pa_inbox_monitor/CLAUDE.md
+!groups/pa_inbox_monitor/strip-html
 
 # Secrets
 *.keys.json

@@ -1,0 +1,27 @@
+#!/usr/bin/env node
+// Strip HTML tags, tracking URLs, and invisible characters from email body text.
+// Usage: echo "<html content>" | /workspace/group/strip-html [max_chars]
+// Reads stdin, writes cleaned plain text to stdout, truncated to max_chars (default 2500).
+
+const chunks = [];
+process.stdin.on('data', c => chunks.push(c));
+process.stdin.on('end', () => {
+  const maxChars = parseInt(process.argv[2] || '2500', 10);
+  let t = Buffer.concat(chunks).toString('utf8');
+
+  // Remove HTML tags
+  t = t.replace(/<[^>]+>/g, ' ');
+  // Collapse tracking URLs (long URLs add nothing useful)
+  t = t.replace(/https?:\/\/\S{60,}/g, '[url]');
+  // Remove invisible/zero-width characters common in HTML newsletters
+  t = t.replace(/[\u00ad\u200b\u200c\u200d\u200e\u200f\ufeff\xa0]+/g, ' ');
+  // Decode common HTML entities
+  t = t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
+       .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  // Collapse whitespace
+  t = t.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+
+  process.stdout.write(t.slice(0, maxChars));
+  if (t.length > maxChars) process.stdout.write('\n[truncated]');
+  process.stdout.write('\n');
+});

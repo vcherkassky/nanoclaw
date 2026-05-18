@@ -534,6 +534,81 @@ This allows the agent to understand the conversation context even if it wasn't m
 
 ---
 
+## Email Processing Architecture
+
+### The Problem: Models Always Want to Respond
+
+When a single agent handles both email triage and user conversation, every model — regardless
+of how strongly the instructions say "produce no output" — will write confirmations like
+"Logged." or "No WhatsApp notification is sent." This is not a prompt engineering problem; it
+is a training instinct. Models are RLHF-trained to always produce a response. Prompt
+instructions fight against that instinct and lose under context pressure.
+
+### The Solution: Separate the Concerns
+
+Email processing is split into two agents sharing the same WhatsApp group:
+
+- **`pa_email_processor`** — headless, runs outside the WhatsApp message loop. Its only
+  output mechanism is a `<notify>...</notify>` tag. The host extracts that tag and sends it
+  to WhatsApp. Everything else the model writes is silently discarded. The model can narrate,
+  reason, and confirm internally — none of it reaches the user.
+
+- **`pa_inbox_monitor`** — conversational agent registered to the same WhatsApp group JID.
+  Handles user-initiated messages normally with full freedom. Never sees email content.
+
+### Flow Diagrams
+
+**Before (single agent):**
+```
+Gmail → classifyEmail → onMessage(JID, emailMsg) → storeMessage → message loop
+  → processGroupMessages → runContainerAgent(pa_inbox_monitor) → text output → WhatsApp
+```
+
+**After (split):**
+```
+Gmail → classifyEmail → onEmailForProcessing(emailMsg) → runContainerAgent(pa_email_processor)
+  → extract <notify>...</notify> → sendMessage(PUBLIC_INBOX_TARGET_JID)  [if tag present]
+
+WhatsApp message → message loop → processGroupMessages → runContainerAgent(pa_inbox_monitor)
+  → text output → WhatsApp  [unchanged]
+```
+
+### The `<notify>` Contract
+
+The `<notify>` tag is the only output path from the email processor to the user:
+
+- **LOGGED emails**: the model produces no `<notify>` block → nothing sent to WhatsApp.
+- **ACTIONED emails**: the model wraps the 3-line signal in `<notify>...</notify>`.
+- All other text (reasoning, log writes, internal narration) is accumulated by the host and
+  then discarded — it never reaches the channel.
+
+This inverts the default: instead of "write nothing unless notifying", the model always has
+permission to write freely, and the host filters to only what is explicitly tagged.
+
+### Implementation Details
+
+- **`onEmailForProcessing`** callback in `ChannelOpts` (registry.ts) and `GmailChannelOpts`
+  (gmail.ts): when set, the gmail-monitor channel calls this instead of `onMessage`, so emails
+  never enter the SQLite message store or the main message loop.
+- **`processEmailHeadless()`** in `index.ts`: constructs an ad-hoc `RegisteredGroup` config
+  for `pa_email_processor` (not registered in DB), calls `runContainerAgent` directly,
+  collects all output, regex-extracts `<notify>`, and forwards to the target JID.
+- **Serial queue** (`emailProcessorChain`): emails are processed one at a time to avoid
+  concurrent container name conflicts and log file contention.
+- **`pa_inbox_monitor` group**: `requiresTrigger = 1` — conversational agent only responds
+  to explicit `@Claw` mentions.
+
+### Generalising the Pattern
+
+This headless agent pattern works for any event-driven integration where:
+1. Events arrive from an external source (not from a user message)
+2. Output should be selective (only some events notify the user)
+3. The agent should not pollute a conversational channel with processing chatter
+
+Other candidates: calendar reminders, webhook receivers, monitoring alerts.
+
+---
+
 ## Commands
 
 ### Commands Available in Any Group

@@ -17,6 +17,7 @@ import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  NewMessage,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
@@ -27,6 +28,7 @@ export interface GmailChannelOpts {
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
   sendNotification?: (text: string, jid?: string) => Promise<void>;
+  onEmailForProcessing?: (msg: NewMessage) => void;
   allowedSenders?: Set<string>; // if set, only these addresses trigger the agent
   targetJid?: string; // if set, deliver to this group JID instead of first main group
   credentialsDir?: string; // defaults to ~/.gmail-mcp
@@ -584,8 +586,7 @@ export class GmailChannel implements Channel {
 
     if (!quarantined) {
       const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
-
-      this.opts.onMessage(mainJid, {
+      const emailMsg = {
         id: messageId,
         chat_jid: mainJid,
         sender: senderEmail,
@@ -593,7 +594,18 @@ export class GmailChannel implements Channel {
         content,
         timestamp,
         is_from_me: false,
-      });
+      };
+      if (this.opts.useClassifier && this.opts.onEmailForProcessing) {
+        try {
+          await this.opts.onEmailForProcessing(emailMsg);
+        } catch {
+          // Agent failed — remove from processedIds so next poll retries
+          this.processedIds.delete(messageId);
+          return; // Skip label — email will be re-delivered next poll
+        }
+      } else {
+        this.opts.onMessage(mainJid, emailMsg);
+      }
     }
 
     // Track processing: label (monitor channel) or mark-as-read (PA channel)

@@ -595,7 +595,9 @@ describe('SlackChannel', () => {
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
         channel: 'D9876543210',
         text: 'DM message',
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'DM message' } }],
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'DM message' } },
+        ],
       });
     });
 
@@ -638,12 +640,16 @@ describe('SlackChannel', () => {
       expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(1, {
         channel: 'C0123456789',
         text: 'A'.repeat(3000),
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'A'.repeat(3000) } }],
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'A'.repeat(3000) } },
+        ],
       });
       expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(2, {
         channel: 'C0123456789',
         text: 'A'.repeat(500),
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'A'.repeat(500) } }],
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'A'.repeat(500) } },
+        ],
       });
     });
 
@@ -691,12 +697,16 @@ describe('SlackChannel', () => {
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
         channel: 'C0123456789',
         text: 'First queued',
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'First queued' } }],
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'First queued' } },
+        ],
       });
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledWith({
         channel: 'C0123456789',
         text: 'Second queued',
-        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'Second queued' } }],
+        blocks: [
+          { type: 'section', text: { type: 'mrkdwn', text: 'Second queued' } },
+        ],
       });
     });
   });

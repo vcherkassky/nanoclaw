@@ -190,6 +190,7 @@ export async function classifyEmail(
   const requestBody = {
     model,
     stream: false,
+    options: { num_ctx: 32768 },
     messages: [
       { role: 'system', content: SANDBOX_PROMPT },
       { role: 'user', content: userContent },
