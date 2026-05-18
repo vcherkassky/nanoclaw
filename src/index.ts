@@ -44,7 +44,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -391,7 +391,9 @@ async function runAgent(
 async function processEmailHeadless(msg: NewMessage): Promise<void> {
   const targetJid = PUBLIC_INBOX_TARGET_JID;
   if (!targetJid) {
-    logger.warn('processEmailHeadless: PUBLIC_INBOX_TARGET_JID not set, skipping');
+    logger.warn(
+      'processEmailHeadless: PUBLIC_INBOX_TARGET_JID not set, skipping',
+    );
     return;
   }
 
@@ -405,13 +407,21 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
       timeout: 600000,
       idleTimeoutMs: 0,
       additionalMounts: [
-        { hostPath: '/Users/viktor/Documents/Knowledge Base', containerPath: 'kb', readonly: false },
+        {
+          hostPath: '/Users/viktor/Documents/Knowledge Base',
+          containerPath: 'kb',
+          readonly: false,
+        },
       ],
     },
     requiresTrigger: false,
   };
 
   const outputChunks: string[] = [];
+  const groupIpcDir = resolveGroupIpcPath('pa_email_processor');
+  const closeFile = path.join(groupIpcDir, 'input', '_close');
+  let closeSent = false;
+
   const result = await runContainerAgent(
     emailProcessorGroup,
     {
@@ -432,6 +442,16 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
             : JSON.stringify(output.result);
         outputChunks.push(raw);
       }
+      // Tell the container to exit after its first complete turn.
+      // Without this it blocks in waitForIpcMessage() for the full 10-min timeout.
+      if (!closeSent) {
+        closeSent = true;
+        try {
+          fs.writeFileSync(closeFile, '');
+        } catch {
+          // Non-fatal: hard timeout will still kill the container
+        }
+      }
     },
   );
 
@@ -449,7 +469,10 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
       if (channel) {
         await channel.sendMessage(targetJid, notifyText);
       } else {
-        logger.warn({ targetJid }, 'Email processor: no channel for target JID');
+        logger.warn(
+          { targetJid },
+          'Email processor: no channel for target JID',
+        );
       }
     }
   }
