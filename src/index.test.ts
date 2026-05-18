@@ -9,6 +9,7 @@ vi.mock('./config.js', () => ({
   POLL_INTERVAL: 1_000,
   TIMEZONE: 'UTC',
   CREDENTIAL_PROXY_PORT: 9999,
+  PUBLIC_INBOX_TARGET_JID: 'pa-inbox@g.us',
 }));
 
 vi.mock('./logger.js', () => ({
@@ -88,16 +89,21 @@ vi.mock('./group-folder.js', () => ({
 
 vi.mock('fs', async () => {
   const actual = await vi.importActual<typeof import('fs')>('fs');
-  return { ...actual, default: { ...actual, mkdirSync: vi.fn() } };
+  return {
+    ...actual,
+    default: { ...actual, mkdirSync: vi.fn(), writeFileSync: vi.fn() },
+  };
 });
 
 // --- Imports (after mocks) ---
 
-import { getMessagesSince } from './db.js';
-import { runContainerAgent } from './container-runner.js';
+import fs from 'fs';
+import { getMessagesSince, getAllTasks } from './db.js';
+import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
 import { findChannel } from './router.js';
 import {
   _processGroupMessages,
+  _processEmailHeadless,
   _resetLastAgentTimestamp,
   _setChannels,
   _setRegisteredGroups,
@@ -222,5 +228,122 @@ describe('processGroupMessages — error notification', () => {
       .mock.calls.find((args) => args[1] === 'Agent error — please try again.');
     expect(errorCall).toBeUndefined();
     expect(result).toBe(true);
+  });
+});
+
+// --- processEmailHeadless tests ---
+
+const PA_JID = 'pa-inbox@g.us';
+
+function makeEmailMsg(content = 'From: test@example.com\nSubject: Hi\n\nBody') {
+  return {
+    id: 'msg1',
+    chat_jid: PA_JID,
+    sender: 'test@example.com',
+    content,
+    timestamp: '2026-01-01T00:00:00.000Z',
+    is_from_me: false,
+    is_bot_message: false,
+  };
+}
+
+describe('processEmailHeadless', () => {
+  beforeEach(() => {
+    vi.mocked(getAllTasks).mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('extracts <notify> tag and sends to WhatsApp', async () => {
+    const channel = makeMockChannel();
+    _setChannels([channel as any]);
+    vi.mocked(findChannel).mockReturnValue(channel as any);
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _register, onOutput) => {
+        if (onOutput) {
+          await onOutput({
+            status: 'success',
+            result: 'Logged.\n<notify>New invoice from Acme — £1,200 due Friday</notify>',
+          });
+        }
+        return { status: 'success', result: null };
+      },
+    );
+
+    await _processEmailHeadless(makeEmailMsg() as any);
+
+    expect(channel.sendMessage).toHaveBeenCalledOnce();
+    expect(channel.sendMessage).toHaveBeenCalledWith(
+      PA_JID,
+      'New invoice from Acme — £1,200 due Friday',
+    );
+  });
+
+  it('sends nothing when output contains no <notify> tag', async () => {
+    const channel = makeMockChannel();
+    _setChannels([channel as any]);
+    vi.mocked(findChannel).mockReturnValue(channel as any);
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _register, onOutput) => {
+        if (onOutput) {
+          await onOutput({ status: 'success', result: 'Logged. No action needed.' });
+        }
+        return { status: 'success', result: null };
+      },
+    );
+
+    await _processEmailHeadless(makeEmailMsg() as any);
+
+    expect(channel.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('writes _close sentinel after first output to prevent 10-min idle wait', async () => {
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _register, onOutput) => {
+        if (onOutput) await onOutput({ status: 'success', result: 'Done.' });
+        return { status: 'success', result: null };
+      },
+    );
+
+    await _processEmailHeadless(makeEmailMsg() as any);
+
+    const writeFileCalls = vi.mocked(fs.writeFileSync).mock.calls;
+    const closeCalls = writeFileCalls.filter((args) =>
+      String(args[0]).endsWith('_close'),
+    );
+    expect(closeCalls).toHaveLength(1);
+  });
+
+  it('writes task and group snapshots before spawning the container', async () => {
+    const spawnOrder: string[] = [];
+    vi.mocked(writeTasksSnapshot).mockImplementation(() => {
+      spawnOrder.push('tasks');
+    });
+    vi.mocked(writeGroupsSnapshot).mockImplementation(() => {
+      spawnOrder.push('groups');
+    });
+    vi.mocked(runContainerAgent).mockImplementation(async () => {
+      spawnOrder.push('spawn');
+      return { status: 'success', result: null };
+    });
+
+    await _processEmailHeadless(makeEmailMsg() as any);
+
+    expect(spawnOrder.indexOf('tasks')).toBeLessThan(spawnOrder.indexOf('spawn'));
+    expect(spawnOrder.indexOf('groups')).toBeLessThan(spawnOrder.indexOf('spawn'));
+  });
+
+  it('throws when the container returns an error', async () => {
+    vi.mocked(runContainerAgent).mockResolvedValue({
+      status: 'error',
+      result: null,
+      error: 'container timeout',
+    });
+
+    await expect(_processEmailHeadless(makeEmailMsg() as any)).rejects.toThrow(
+      'container timeout',
+    );
   });
 });

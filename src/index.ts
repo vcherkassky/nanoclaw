@@ -163,6 +163,8 @@ export function _resetLastAgentTimestamp(): void {
 
 /** @internal - exported for testing */
 export { processGroupMessages as _processGroupMessages };
+/** @internal - exported for testing */
+export { processEmailHeadless as _processEmailHeadless };
 
 /**
  * Process all pending messages for a group.
