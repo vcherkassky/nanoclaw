@@ -1,7 +1,8 @@
-const LEVELS = { debug: 20, info: 30, warn: 40, error: 50, fatal: 60 } as const;
+const LEVELS = { trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60 } as const;
 type Level = keyof typeof LEVELS;
 
 const COLORS: Record<Level, string> = {
+  trace: '\x1b[37m',
   debug: '\x1b[34m',
   info: '\x1b[32m',
   warn: '\x1b[33m',
@@ -59,18 +60,43 @@ function log(
   }
 }
 
-export const logger = {
-  debug: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
-    log('debug', dataOrMsg, msg),
-  info: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
-    log('info', dataOrMsg, msg),
-  warn: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
-    log('warn', dataOrMsg, msg),
-  error: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
-    log('error', dataOrMsg, msg),
-  fatal: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
-    log('fatal', dataOrMsg, msg),
-};
+function makeLogger(bindings: Record<string, unknown> = {}) {
+  function boundLog(
+    level: Level,
+    dataOrMsg: Record<string, unknown> | string,
+    msg?: string,
+  ): void {
+    if (Object.keys(bindings).length === 0) {
+      log(level, dataOrMsg, msg);
+      return;
+    }
+    if (typeof dataOrMsg === 'string') {
+      log(level, { ...bindings }, dataOrMsg);
+    } else {
+      log(level, { ...bindings, ...dataOrMsg }, msg);
+    }
+  }
+
+  return {
+    trace: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
+      boundLog('trace', dataOrMsg, msg),
+    debug: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
+      boundLog('debug', dataOrMsg, msg),
+    info: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
+      boundLog('info', dataOrMsg, msg),
+    warn: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
+      boundLog('warn', dataOrMsg, msg),
+    error: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
+      boundLog('error', dataOrMsg, msg),
+    fatal: (dataOrMsg: Record<string, unknown> | string, msg?: string) =>
+      boundLog('fatal', dataOrMsg, msg),
+    child: (childBindings: Record<string, unknown>) =>
+      makeLogger({ ...bindings, ...childBindings }),
+    level: process.env.LOG_LEVEL || 'info',
+  };
+}
+
+export const logger = makeLogger();
 
 // Route uncaught errors through logger so they get timestamps in stderr
 process.on('uncaughtException', (err) => {

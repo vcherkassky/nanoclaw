@@ -99,7 +99,11 @@ vi.mock('fs', async () => {
 
 import fs from 'fs';
 import { getMessagesSince, getAllTasks } from './db.js';
-import { runContainerAgent, writeTasksSnapshot, writeGroupsSnapshot } from './container-runner.js';
+import {
+  runContainerAgent,
+  writeTasksSnapshot,
+  writeGroupsSnapshot,
+} from './container-runner.js';
 import { findChannel } from './router.js';
 import {
   _processGroupMessages,
@@ -265,7 +269,8 @@ describe('processEmailHeadless', () => {
         if (onOutput) {
           await onOutput({
             status: 'success',
-            result: 'Logged.\n<notify>New invoice from Acme — £1,200 due Friday</notify>',
+            result:
+              'Logged.\n<notify>New invoice from Acme — £1,200 due Friday</notify>',
           });
         }
         return { status: 'success', result: null };
@@ -288,7 +293,10 @@ describe('processEmailHeadless', () => {
     vi.mocked(runContainerAgent).mockImplementation(
       async (_group, _input, _register, onOutput) => {
         if (onOutput) {
-          await onOutput({ status: 'success', result: 'Logged. No action needed.' });
+          await onOutput({
+            status: 'success',
+            result: 'Logged. No action needed.',
+          });
         }
         return { status: 'success', result: null };
       },
@@ -331,8 +339,12 @@ describe('processEmailHeadless', () => {
 
     await _processEmailHeadless(makeEmailMsg() as any);
 
-    expect(spawnOrder.indexOf('tasks')).toBeLessThan(spawnOrder.indexOf('spawn'));
-    expect(spawnOrder.indexOf('groups')).toBeLessThan(spawnOrder.indexOf('spawn'));
+    expect(spawnOrder.indexOf('tasks')).toBeLessThan(
+      spawnOrder.indexOf('spawn'),
+    );
+    expect(spawnOrder.indexOf('groups')).toBeLessThan(
+      spawnOrder.indexOf('spawn'),
+    );
   });
 
   it('throws when the container returns an error', async () => {
