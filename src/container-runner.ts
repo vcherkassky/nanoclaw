@@ -447,7 +447,8 @@ export async function runContainerAgent(
     // graceful _close sentinel has time to trigger before the hard kill fires.
     // Headless containers (no GroupQueue idle timer) can set idleTimeoutMs: 0
     // to skip the grace period and use configTimeout directly.
-    const effectiveIdleTimeout = group.containerConfig?.idleTimeoutMs ?? IDLE_TIMEOUT;
+    const effectiveIdleTimeout =
+      group.containerConfig?.idleTimeoutMs ?? IDLE_TIMEOUT;
     const timeoutMs = Math.max(configTimeout, effectiveIdleTimeout + 30_000);
 
     const killOnTimeout = () => {
