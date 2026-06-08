@@ -108,8 +108,8 @@ describe('remote-control', () => {
 
       const spawnCall = spawnMock.mock.calls[0];
       const options = spawnCall[2];
-      // stdio should use file descriptors (numbers), not 'pipe'
-      expect(options.stdio[0]).toBe('ignore');
+      // stdin uses 'pipe' so we can write 'y\n' to auto-accept the prompt
+      expect(options.stdio[0]).toBe('pipe');
       expect(typeof options.stdio[1]).toBe('number');
       expect(typeof options.stdio[2]).toBe('number');
     });

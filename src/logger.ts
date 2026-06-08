@@ -1,4 +1,11 @@
-const LEVELS = { trace: 10, debug: 20, info: 30, warn: 40, error: 50, fatal: 60 } as const;
+const LEVELS = {
+  trace: 10,
+  debug: 20,
+  info: 30,
+  warn: 40,
+  error: 50,
+  fatal: 60,
+} as const;
 type Level = keyof typeof LEVELS;
 
 const COLORS: Record<Level, string> = {
