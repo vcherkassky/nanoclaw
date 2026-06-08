@@ -8,6 +8,14 @@ dist/
 store/
 data/
 logs/
+nanoclaw.db
+
+# Test coverage
+coverage/
+
+# Per-install launcher and scheduler lock
+start.sh
+.claude/scheduled_tasks.lock
 
 # Groups - only track base structure and specific CLAUDE.md files
 groups/*
