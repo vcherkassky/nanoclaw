@@ -6,12 +6,15 @@ import {
   ASSISTANT_NAME,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
+  OLLAMA_PROXY_PORT,
+  OLLAMA_REAL_HOST,
   POLL_INTERVAL,
   PUBLIC_INBOX_TARGET_JID,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { OllamaProxy } from './ollama-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -641,10 +644,17 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Start Ollama proxy (host + containers route Ollama traffic through this
+  // to ensure only one model is loaded at a time).
+  const ollamaProxy = new OllamaProxy({ realHost: OLLAMA_REAL_HOST });
+  await ollamaProxy.listen(OLLAMA_PROXY_PORT);
+  await ollamaProxy.syncCurrentModel();
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    await ollamaProxy.close();
     for (const proc of activeHeadlessContainers) proc.kill('SIGTERM');
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
