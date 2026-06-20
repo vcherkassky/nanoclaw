@@ -170,13 +170,21 @@ async function resolveModel(ollamaHost: string): Promise<string | null> {
 // Classification
 // ---------------------------------------------------------------------------
 
+export interface ClassifyEmailOptions {
+  /** Override OLLAMA_CLASSIFIER_MODEL (env-derived) for this single call. */
+  modelOverride?: string;
+  /** Skip writing to the quarantine log — useful for comparison harnesses. */
+  dryRun?: boolean;
+}
+
 export async function classifyEmail(
   email: SanitizedEmail,
+  opts: ClassifyEmailOptions = {},
 ): Promise<ClassificationResult> {
   const env = readEnvFile(['OLLAMA_HOST']);
   const ollamaHost = env.OLLAMA_HOST || 'http://localhost:11434';
 
-  const model = await resolveModel(ollamaHost);
+  const model = opts.modelOverride ?? (await resolveModel(ollamaHost));
   if (!model) {
     logger.warn('Email classifier: no Ollama model available');
     return { retry: true, reason: 'No Ollama model available' };
@@ -289,13 +297,15 @@ export async function classifyEmail(
       { emailId: email.id, elapsedMs: elapsed(), tool: toolName },
       'Email classifier: honeypot triggered — tool call detected',
     );
-    appendQuarantineLog({
-      email_id: email.id,
-      from: email.from,
-      subject: email.subject,
-      reason: 'Honeypot triggered (tool call)',
-      type: 'tool_call',
-    });
+    if (!opts.dryRun) {
+      appendQuarantineLog({
+        email_id: email.id,
+        from: email.from,
+        subject: email.subject,
+        reason: 'Honeypot triggered (tool call)',
+        type: 'tool_call',
+      });
+    }
     return {
       safe: false,
       reason: 'Honeypot triggered (tool call)',
@@ -357,13 +367,15 @@ export async function classifyEmail(
       { emailId: email.id, elapsedMs: elapsed(), reason },
       'Email classifier: prompt injection detected, quarantining',
     );
-    appendQuarantineLog({
-      email_id: email.id,
-      from: email.from,
-      subject: email.subject,
-      reason,
-      type: 'classifier_verdict',
-    });
+    if (!opts.dryRun) {
+      appendQuarantineLog({
+        email_id: email.id,
+        from: email.from,
+        subject: email.subject,
+        reason,
+        type: 'classifier_verdict',
+      });
+    }
     return { safe: false, reason, type: 'classifier_verdict' };
   }
 

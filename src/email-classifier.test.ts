@@ -369,4 +369,56 @@ describe('classifyEmail', () => {
     const logPath = path.join(tmpDir, 'store', 'email-quarantine.jsonl');
     expect(fs.existsSync(logPath)).toBe(false);
   });
+
+  it('uses modelOverride when provided, ignoring env', async () => {
+    setEnv('env-model');
+    const fetchMock = mockOllamaResponse('{"is_safe":true,"reason":"SAFE"}');
+    vi.stubGlobal('fetch', fetchMock);
+
+    await classifyEmail(makeSanitized(), { modelOverride: 'override-model' });
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.model).toBe('override-model');
+  });
+
+  it('dryRun=true skips quarantine log writes on classifier verdict', async () => {
+    setEnv();
+    vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
+    vi.stubGlobal(
+      'fetch',
+      mockOllamaResponse('{"is_safe":false,"reason":"PROMPT_INJECTION"}'),
+    );
+
+    const result = await classifyEmail(makeSanitized(), { dryRun: true });
+
+    expect(result).toMatchObject({ safe: false, reason: 'PROMPT_INJECTION' });
+    const logPath = path.join(tmpDir, 'store', 'email-quarantine.jsonl');
+    expect(fs.existsSync(logPath)).toBe(false);
+  });
+
+  it('dryRun=true skips quarantine log writes on honeypot tool call', async () => {
+    setEnv();
+    vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: vi.fn().mockResolvedValue({
+          message: {
+            content: '',
+            tool_calls: [
+              { function: { name: 'signal_unsafe', arguments: {} } },
+            ],
+          },
+        }),
+        text: vi.fn().mockResolvedValue(''),
+      }),
+    );
+
+    const result = await classifyEmail(makeSanitized(), { dryRun: true });
+
+    expect(result).toMatchObject({ safe: false, type: 'tool_call' });
+    const logPath = path.join(tmpDir, 'store', 'email-quarantine.jsonl');
+    expect(fs.existsSync(logPath)).toBe(false);
+  });
 });
