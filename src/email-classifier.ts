@@ -99,8 +99,19 @@ export function sanitizeEmail(
     .slice(0, 255);
 
   // Sanitize body: strip HTML, JavaScript schemes, event handlers,
-  // non-printable ASCII, cap at 8000 chars
+  // non-printable ASCII, cap at 8000 chars.
+  //
+  // HTML comments are a known injection hiding place \u2014 the bytes are invisible
+  // to a human reading the rendered email but get seen by an LLM if we forward
+  // them. We extract the comment's text and wrap it with a HIDDEN-TEXT marker
+  // so the classifier sees both the payload AND that it was concealed. The
+  // marker is then a strong on-its-own signal (legitimate emails should never
+  // contain hidden text).
   const cleanBody = body
+    .replace(
+      /<!--([\s\S]*?)-->/g,
+      (_match, inner: string) => ` [HIDDEN-TEXT: ${inner.trim()}] `,
+    )
     .replace(/<[^>]*>/g, ' ')
     .replace(/javascript:/gi, '')
     .replace(/on\w+\s*=/gi, '')
