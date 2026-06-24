@@ -5,18 +5,28 @@ import { logger } from './logger.js';
  * Extract a session slash command from a message, stripping the trigger prefix if present.
  * Returns the slash command (e.g., '/compact') or null if not a session command.
  */
-export function extractSessionCommand(content: string, triggerPattern: RegExp): string | null {
+export function extractSessionCommand(
+  content: string,
+  triggerPattern: RegExp,
+): string | null {
   let text = content.trim();
   text = text.replace(triggerPattern, '').trim();
   if (text === '/compact') return '/compact';
+  if (text === '/context') return '/context';
   return null;
 }
+
+/** Commands that are handled entirely on the host (no agent invocation). */
+const HOST_HANDLED = new Set(['/context']);
 
 /**
  * Check if a session command sender is authorized.
  * Allowed: main group (any sender), or trusted/admin sender (is_from_me) in any group.
  */
-export function isSessionCommandAllowed(isMainGroup: boolean, isFromMe: boolean): boolean {
+export function isSessionCommandAllowed(
+  isMainGroup: boolean,
+  isFromMe: boolean,
+): boolean {
   return isMainGroup || isFromMe;
 }
 
@@ -39,6 +49,8 @@ export interface SessionCommandDeps {
   formatMessages: (msgs: NewMessage[], timezone: string) => string;
   /** Whether the denied sender would normally be allowed to interact (for denial messages). */
   canSenderInteract: (msg: NewMessage) => boolean;
+  /** Returns a human-readable summary of current session context size. Used by /context. */
+  describeContext?: () => string;
 }
 
 function resultToText(result: string | object | null | undefined): string {
@@ -61,12 +73,21 @@ export async function handleSessionCommand(opts: {
   timezone: string;
   deps: SessionCommandDeps;
 }): Promise<{ handled: false } | { handled: true; success: boolean }> {
-  const { missedMessages, isMainGroup, groupName, triggerPattern, timezone, deps } = opts;
+  const {
+    missedMessages,
+    isMainGroup,
+    groupName,
+    triggerPattern,
+    timezone,
+    deps,
+  } = opts;
 
   const cmdMsg = missedMessages.find(
     (m) => extractSessionCommand(m.content, triggerPattern) !== null,
   );
-  const command = cmdMsg ? extractSessionCommand(cmdMsg.content, triggerPattern) : null;
+  const command = cmdMsg
+    ? extractSessionCommand(cmdMsg.content, triggerPattern)
+    : null;
 
   if (!command || !cmdMsg) return { handled: false };
 
@@ -84,6 +105,16 @@ export async function handleSessionCommand(opts: {
 
   // AUTHORIZED: process pre-compact messages first, then run the command
   logger.info({ group: groupName, command }, 'Session command');
+
+  // Host-handled commands (e.g. /context) don't need the agent.
+  if (HOST_HANDLED.has(command)) {
+    const text = deps.describeContext
+      ? deps.describeContext()
+      : 'Context inspection is not available in this build.';
+    await deps.sendMessage(text);
+    deps.advanceCursor(cmdMsg.timestamp);
+    return { handled: true, success: true };
+  }
 
   const cmdIndex = missedMessages.indexOf(cmdMsg);
   const preCompactMsgs = missedMessages.slice(0, cmdIndex);
@@ -109,8 +140,13 @@ export async function handleSessionCommand(opts: {
     });
 
     if (preResult === 'error' || hadPreError) {
-      logger.warn({ group: groupName }, 'Pre-compact processing failed, aborting session command');
-      await deps.sendMessage(`Failed to process messages before ${command}. Try again.`);
+      logger.warn(
+        { group: groupName },
+        'Pre-compact processing failed, aborting session command',
+      );
+      await deps.sendMessage(
+        `Failed to process messages before ${command}. Try again.`,
+      );
       if (preOutputSent) {
         // Output was already sent — don't retry or it will duplicate.
         // Advance cursor past pre-compact messages, leave command pending.

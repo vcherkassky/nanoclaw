@@ -61,6 +61,10 @@ export const OLLAMA_PROXY_PORT = parseInt(
 );
 export const OLLAMA_REAL_HOST =
   process.env.OLLAMA_REAL_HOST || 'http://127.0.0.1:11434';
+export const CONTEXT_WARN_TOKENS = parseInt(
+  process.env.CONTEXT_WARN_TOKENS || '80000',
+  10,
+);
 export const IPC_POLL_INTERVAL = 1000;
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(

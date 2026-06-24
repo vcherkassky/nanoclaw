@@ -4,6 +4,7 @@ import type { ChildProcess } from 'child_process';
 
 import {
   ASSISTANT_NAME,
+  CONTEXT_WARN_TOKENS,
   CREDENTIAL_PROXY_PORT,
   IDLE_TIMEOUT,
   OLLAMA_PROXY_PORT,
@@ -13,6 +14,10 @@ import {
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
+import {
+  estimateSessionTokens,
+  formatSessionEstimate,
+} from './context-monitor.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import { OllamaProxy } from './ollama-proxy.js';
 import './channels/index.js';
@@ -62,7 +67,11 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
-import { extractSessionCommand, handleSessionCommand, isSessionCommandAllowed } from './session-commands.js';
+import {
+  extractSessionCommand,
+  handleSessionCommand,
+  isSessionCommandAllowed,
+} from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -77,6 +86,7 @@ let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 let emailProcessorChain = Promise.resolve();
 const activeHeadlessContainers = new Set<ChildProcess>();
+const warnedContextSessions = new Set<string>();
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -204,23 +214,67 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     timezone: TIMEZONE,
     deps: {
       sendMessage: (text) => channel.sendMessage(chatJid, text),
-      setTyping: (typing) => channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
-      runAgent: (prompt, onOutput) => runAgent(group, prompt, chatJid, onOutput),
+      setTyping: (typing) =>
+        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      runAgent: (prompt, onOutput) =>
+        runAgent(group, prompt, chatJid, onOutput),
       closeStdin: () => queue.closeStdin(chatJid),
-      advanceCursor: (ts) => { lastAgentTimestamp[chatJid] = ts; saveState(); },
+      advanceCursor: (ts) => {
+        lastAgentTimestamp[chatJid] = ts;
+        saveState();
+      },
       formatMessages,
       canSenderInteract: (msg) => {
         const hasTrigger = TRIGGER_PATTERN.test(msg.content.trim());
         const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
-        return isMainGroup || !reqTrigger || (hasTrigger && (
-          msg.is_from_me ||
-          isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())
-        ));
+        return (
+          isMainGroup ||
+          !reqTrigger ||
+          (hasTrigger &&
+            (msg.is_from_me ||
+              isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+        );
+      },
+      describeContext: () => {
+        const sid = sessions[group.folder];
+        if (!sid) return 'No active session yet — context is empty.';
+        const e = estimateSessionTokens(sid, group.folder);
+        return formatSessionEstimate(e);
       },
     },
   });
   if (cmdResult.handled) return cmdResult.success;
   // --- End session command interception ---
+
+  // --- Context-size warning ---
+  // Fire once per session ID. After /compact succeeds the SDK returns a new
+  // session ID, so the next message's check will see a fresh (small) file
+  // and the warning is naturally re-armed.
+  const activeSessionId = sessions[group.folder];
+  if (activeSessionId && !warnedContextSessions.has(activeSessionId)) {
+    const est = estimateSessionTokens(activeSessionId, group.folder);
+    if (est.estimatedTokens >= CONTEXT_WARN_TOKENS) {
+      warnedContextSessions.add(activeSessionId);
+      const k = Math.round(est.estimatedTokens / 1000);
+      logger.warn(
+        {
+          group: group.name,
+          sessionId: activeSessionId,
+          estimatedTokens: est.estimatedTokens,
+        },
+        'Session context above warning threshold',
+      );
+      channel
+        .sendMessage(
+          chatJid,
+          `⚠️ Conversation context at ~${k}k tokens. Send \`/compact\` to summarize history and prevent slowdowns. (\`/context\` to recheck.)`,
+        )
+        .catch((err) =>
+          logger.warn({ chatJid, err }, 'Failed to send context warning'),
+        );
+    }
+  }
+  // --- End context-size warning ---
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -595,7 +649,12 @@ async function startMessageLoop(): Promise<void> {
             // Only close active container if the sender is authorized — otherwise an
             // untrusted user could kill in-flight work by sending /compact (DoS).
             // closeStdin no-ops internally when no container is active.
-            if (isSessionCommandAllowed(isMainGroup, loopCmdMsg.is_from_me === true)) {
+            if (
+              isSessionCommandAllowed(
+                isMainGroup,
+                loopCmdMsg.is_from_me === true,
+              )
+            ) {
               queue.closeStdin(chatJid);
             }
             // Enqueue so processGroupMessages handles auth + cursor advancement.
