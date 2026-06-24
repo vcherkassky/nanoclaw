@@ -419,6 +419,10 @@ async function runQuery(
       command: 'npx',
       args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
     },
+    calendar: {
+      command: 'node',
+      args: [path.join(path.dirname(mcpServerPath), 'calendar-mcp-stdio.js')],
+    },
   };
 
   // Context dump: probe MCP schemas before the query (only when flag is set)
@@ -458,6 +462,7 @@ async function runQuery(
         'mcp__nanoclaw__*',
         'mcp__linear__*',
         'mcp__gmail__*',
+        'mcp__calendar__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
