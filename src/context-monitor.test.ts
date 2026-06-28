@@ -5,6 +5,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  describeGroupContext,
   estimateSessionTokens,
   findLatestSessionId,
   formatSessionEstimate,
@@ -248,6 +249,71 @@ describe('findLatestSessionId', () => {
         dataDir: path.join(tmpDir, 'data'),
       }),
     ).toBeNull();
+  });
+});
+
+describe('describeGroupContext', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-monitor-describe-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeSession(
+    folder: string,
+    sessionId: string,
+    body: string,
+    mtimeMs?: number,
+  ): void {
+    const dir = path.join(
+      tmpDir,
+      'data',
+      'sessions',
+      folder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${sessionId}.jsonl`);
+    fs.writeFileSync(filePath, body);
+    if (mtimeMs) fs.utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
+  }
+
+  it('falls back to the newest on-disk session when none is tracked', () => {
+    // Reproduces the noSession-group bug: the in-memory map has no entry,
+    // but a real transcript exists on disk and should be reported.
+    writeSession('g', 'on-disk-sess', 'z'.repeat(800));
+    const text = describeGroupContext('g', undefined, {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(text.toLowerCase()).not.toContain('no active session yet');
+    expect(text).toContain('on-disk-'); // short id of the on-disk session
+    expect(text).toContain('200'); // 800 bytes / 4 = 200 tokens
+  });
+
+  it('uses the tracked session id when one is provided', () => {
+    writeSession('g', 'tracked-sess', 'a'.repeat(400));
+    writeSession('g', 'other-sess', 'b'.repeat(4000), Date.now() + 5000);
+    const text = describeGroupContext('g', 'tracked-sess', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(text).toContain('tracked-'); // tracked id, not the newer "other-sess"
+    expect(text).toContain('100'); // 400 bytes / 4 = 100 tokens
+  });
+
+  it('reports empty when nothing is tracked and no files exist on disk', () => {
+    const text = describeGroupContext('g', undefined, {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(text.toLowerCase()).toContain('no active session yet');
   });
 });
 

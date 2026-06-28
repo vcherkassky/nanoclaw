@@ -299,6 +299,28 @@ export function formatSessionEstimate(e: SessionEstimate): string {
   return `Session ${sessionShort}…: ~${tokens} tokens (${kbActive} kB on disk). No compaction yet.`;
 }
 
+/**
+ * Resolve a group's effective context and format it for `/context`.
+ *
+ * Prefers the session id we track in memory, but falls back to the newest
+ * session transcript on disk when nothing is tracked. The fallback matters for
+ * groups that run with `noSession` (e.g. scheduled/monitor groups): their
+ * in-memory entry is never populated, yet the SDK still writes a real
+ * transcript to disk. Without the fallback `/context` would report a constant
+ * "no active session" regardless of activity.
+ */
+export function describeGroupContext(
+  groupFolder: string,
+  trackedSessionId: string | undefined,
+  opts: EstimateOptions = {},
+): string {
+  const sessionId =
+    trackedSessionId ?? findLatestSessionId(groupFolder, opts) ?? undefined;
+  if (!sessionId) return 'No active session yet — context is empty.';
+  const estimate = estimateSessionTokens(sessionId, groupFolder, opts);
+  return formatSessionEstimate(estimate);
+}
+
 /** Clear in-memory cache. Useful for tests; also called after /compact. */
 export function clearContextMonitorCache(): void {
   cache.clear();

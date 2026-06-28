@@ -28,9 +28,9 @@ import { SystemProvider } from './status/providers/system.js';
 import { renderTelegramStatus } from './status/renderers/telegram.js';
 import { StatusScheduler } from './status/scheduler.js';
 import {
+  describeGroupContext,
   estimateSessionTokens,
   findLatestSessionId,
-  formatSessionEstimate,
 } from './context-monitor.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import { OllamaProxy } from './ollama-proxy.js';
@@ -250,12 +250,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
         );
       },
-      describeContext: () => {
-        const sid = sessions[group.folder];
-        if (!sid) return 'No active session yet — context is empty.';
-        const e = estimateSessionTokens(sid, group.folder);
-        return formatSessionEstimate(e);
-      },
+      describeContext: () =>
+        describeGroupContext(group.folder, sessions[group.folder]),
       refreshStatus: refreshStatus ? () => refreshStatus!() : undefined,
     },
   });
