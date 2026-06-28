@@ -126,10 +126,7 @@ function sessionFilePath(
   );
 }
 
-function sessionDirPath(
-  dataDir: string,
-  groupFolder: string,
-): string | null {
+function sessionDirPath(dataDir: string, groupFolder: string): string | null {
   if (!SAFE_NAME.test(groupFolder)) return null;
   return path.join(
     dataDir,
