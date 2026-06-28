@@ -12,7 +12,9 @@ describe('AgentRunsProvider', () => {
     });
     const result = await provider.collect();
     expect(result.bucket).toBe('agent');
-    const byLabel = Object.fromEntries(result.rows.map((r) => [r.label, r.value]));
+    const byLabel = Object.fromEntries(
+      result.rows.map((r) => [r.label, r.value]),
+    );
     expect(byLabel['Total (24h)']).toBe('0');
     expect(byLabel['Last run']).toBe('never');
     expect(byLabel['Crashes (24h)']).toBe('0');
@@ -41,7 +43,9 @@ describe('AgentRunsProvider', () => {
     const result = await new AgentRunsProvider({
       now: () => new Date('2026-06-28T12:00:00.000Z').getTime(),
     }).collect();
-    const byLabel = Object.fromEntries(result.rows.map((r) => [r.label, r.value]));
+    const byLabel = Object.fromEntries(
+      result.rows.map((r) => [r.label, r.value]),
+    );
     expect(byLabel['Total (24h)']).toBe('2');
     expect(byLabel['By group (24h)']).toMatch(/main 1/);
     expect(byLabel['By group (24h)']).toMatch(/pa 1/);

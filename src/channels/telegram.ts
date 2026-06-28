@@ -376,7 +376,10 @@ export class TelegramChannel implements Channel {
           console.log(
             `  Send /chatid to the bot to get a chat's registration ID\n`,
           );
-          setRouterState('channel:telegram:last_poll', new Date().toISOString());
+          setRouterState(
+            'channel:telegram:last_poll',
+            new Date().toISOString(),
+          );
           resolve();
         },
       });

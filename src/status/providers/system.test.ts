@@ -10,7 +10,13 @@ describe('SystemProvider', () => {
     expect(result.title).toMatch(/system/i);
     const labels = result.rows.map((r) => r.label);
     expect(labels).toEqual(
-      expect.arrayContaining(['Uptime', 'Version', 'Memory', 'Node', 'Platform']),
+      expect.arrayContaining([
+        'Uptime',
+        'Version',
+        'Memory',
+        'Node',
+        'Platform',
+      ]),
     );
     const versionRow = result.rows.find((r) => r.label === 'Version')!;
     expect(versionRow.value).toContain('1.2.3');

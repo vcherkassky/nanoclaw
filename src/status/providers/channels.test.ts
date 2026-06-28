@@ -23,7 +23,13 @@ function fakeChannel(name: string, connected: boolean) {
 
 describe('ChannelsProvider', () => {
   it('reports connection state + last poll + 24h volume per channel', async () => {
-    storeChatMetadata('tg:1', '2026-06-28T08:00:00.000Z', 'Main', 'telegram', false);
+    storeChatMetadata(
+      'tg:1',
+      '2026-06-28T08:00:00.000Z',
+      'Main',
+      'telegram',
+      false,
+    );
     storeMessage({
       id: 'm1',
       chat_jid: 'tg:1',
