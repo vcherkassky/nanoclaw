@@ -24,6 +24,7 @@ vi.mock('../logger.js', () => ({
 vi.mock('../db.js', () => ({
   getLastGroupSync: vi.fn(() => null),
   setLastGroupSync: vi.fn(),
+  setRouterState: vi.fn(),
   updateChatName: vi.fn(),
 }));
 

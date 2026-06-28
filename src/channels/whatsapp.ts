@@ -17,7 +17,12 @@ import {
   ASSISTANT_NAME,
   STORE_DIR,
 } from '../config.js';
-import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
+import {
+  getLastGroupSync,
+  setLastGroupSync,
+  setRouterState,
+  updateChatName,
+} from '../db.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -125,6 +130,7 @@ export class WhatsAppChannel implements Channel {
         }
       } else if (connection === 'open') {
         this.connected = true;
+        setRouterState('channel:whatsapp:last_poll', new Date().toISOString());
         logger.info('Connected to WhatsApp');
 
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)

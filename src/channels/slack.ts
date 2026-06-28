@@ -2,7 +2,7 @@ import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
-import { updateChatName } from '../db.js';
+import { setRouterState, updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -148,6 +148,7 @@ export class SlackChannel implements Channel {
     }
 
     this.connected = true;
+    setRouterState('channel:slack:last_poll', new Date().toISOString());
 
     // Flush any messages queued before connection
     await this.flushOutgoingQueue();

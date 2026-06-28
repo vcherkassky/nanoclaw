@@ -15,6 +15,7 @@ import {
   clearEmailAttempt,
   getEmailAttempt,
   recordEmailAttempt,
+  setRouterState,
 } from '../db.js';
 import { classifyEmail, sanitizeEmail } from '../email-classifier.js';
 import { readEnvFile } from '../env.js';
@@ -335,6 +336,7 @@ export class GmailChannel implements Channel {
       }
 
       this.consecutiveErrors = 0;
+      setRouterState('channel:gmail:last_poll', new Date().toISOString());
     } catch (err) {
       this.consecutiveErrors++;
       const status =

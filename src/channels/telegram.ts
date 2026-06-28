@@ -5,6 +5,7 @@ import path from 'path';
 import { Api, Bot, type Context } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { setRouterState } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
@@ -375,6 +376,7 @@ export class TelegramChannel implements Channel {
           console.log(
             `  Send /chatid to the bot to get a chat's registration ID\n`,
           );
+          setRouterState('channel:telegram:last_poll', new Date().toISOString());
           resolve();
         },
       });
@@ -453,7 +455,11 @@ export class TelegramChannel implements Channel {
     return String((res as { message_id: number }).message_id);
   }
 
-  async editMessage(jid: string, messageId: string, text: string): Promise<void> {
+  async editMessage(
+    jid: string,
+    messageId: string,
+    text: string,
+  ): Promise<void> {
     if (!this.bot) throw new Error('Telegram bot not initialized');
     const numericId = parseInt(jid.replace(/^tg:/, ''), 10);
     const numericMsg = parseInt(messageId, 10);

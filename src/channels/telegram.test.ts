@@ -24,6 +24,11 @@ vi.mock('../logger.js', () => ({
   },
 }));
 
+// Mock db (setRouterState called on bot start)
+vi.mock('../db.js', () => ({
+  setRouterState: vi.fn(),
+}));
+
 // Mock group-folder (used by downloadFile)
 vi.mock('../group-folder.js', () => ({
   resolveGroupFolderPath: vi.fn(
@@ -1186,11 +1191,7 @@ describe('TelegramChannel optional methods', () => {
     const ch = makeChannelWithFakeApi();
     await ch.editMessage!('tg:123', '4242', 'new body');
     const fakeApi = (ch as any).bot.api;
-    expect(fakeApi.editMessageText).toHaveBeenCalledWith(
-      123,
-      4242,
-      'new body',
-    );
+    expect(fakeApi.editMessageText).toHaveBeenCalledWith(123, 4242, 'new body');
   });
 
   it('pinMessage calls Telegraf pinChatMessage with the right args', async () => {
@@ -1208,9 +1209,9 @@ describe('TelegramChannel optional methods', () => {
         throw new Error('Bad Request: message to edit not found');
       }),
     });
-    await expect(
-      ch.editMessage!('tg:123', '4242', 'x'),
-    ).rejects.toMatchObject({ code: 'message_not_found' });
+    await expect(ch.editMessage!('tg:123', '4242', 'x')).rejects.toMatchObject({
+      code: 'message_not_found',
+    });
   });
 
   it('editMessage swallows "message is not modified" (idempotent edit)', async () => {
@@ -1219,6 +1220,8 @@ describe('TelegramChannel optional methods', () => {
         throw new Error('Bad Request: message is not modified');
       }),
     });
-    await expect(ch.editMessage!('tg:123', '4242', 'x')).resolves.toBeUndefined();
+    await expect(
+      ch.editMessage!('tg:123', '4242', 'x'),
+    ).resolves.toBeUndefined();
   });
 });
