@@ -30,6 +30,7 @@ import { detectAuthMode } from './credential-proxy.js';
 import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { recordAgentRun } from './db.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -489,6 +490,27 @@ export async function runContainerAgent(
     container.on('close', (code) => {
       clearTimeout(timeout);
       const duration = Date.now() - startTime;
+
+      // Record run for status digest (best-effort; failures must not block).
+      try {
+        recordAgentRun({
+          group_folder: group.folder,
+          started_at: new Date(startTime).toISOString(),
+          ended_at: new Date().toISOString(),
+          duration_ms: duration,
+          exit_code: typeof code === 'number' ? code : -1,
+          model: process.env.ANTHROPIC_MODEL ?? null,
+          error_class: timedOut
+            ? hadStreamingOutput
+              ? null
+              : 'timeout'
+            : typeof code === 'number' && code !== 0
+              ? 'crash'
+              : null,
+        });
+      } catch (err) {
+        logger.warn({ err }, 'recordAgentRun failed');
+      }
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
