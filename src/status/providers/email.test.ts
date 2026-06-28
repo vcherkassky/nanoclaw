@@ -14,12 +14,21 @@ import { EmailProvider } from './email.js';
 let tmpQuarantine: string;
 beforeEach(() => {
   _initTestDatabase();
-  tmpQuarantine = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'q-')), 'q.jsonl');
+  tmpQuarantine = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'q-')),
+    'q.jsonl',
+  );
 });
 
 describe('EmailProvider', () => {
   it('handles a clean pipeline with no quarantine', async () => {
-    storeChatMetadata('gmail:1', '2026-06-28T08:00:00.000Z', 'inbox', 'gmail', false);
+    storeChatMetadata(
+      'gmail:1',
+      '2026-06-28T08:00:00.000Z',
+      'inbox',
+      'gmail',
+      false,
+    );
     storeMessage({
       id: 'a',
       chat_jid: 'gmail:1',
@@ -38,7 +47,9 @@ describe('EmailProvider', () => {
     });
     const result = await provider.collect();
     expect(result.bucket).toBe('email');
-    const byLabel = Object.fromEntries(result.rows.map((r) => [r.label, r.value]));
+    const byLabel = Object.fromEntries(
+      result.rows.map((r) => [r.label, r.value]),
+    );
     expect(byLabel['Received (24h)']).toBe('1');
     expect(byLabel['Safe (24h)']).toBe('1');
     expect(byLabel['Quarantined (24h)']).toBe('0');
@@ -60,7 +71,9 @@ describe('EmailProvider', () => {
       now: () => new Date('2026-06-28T09:00:00.000Z').getTime(),
     });
     const result = await provider.collect();
-    const byLabel = Object.fromEntries(result.rows.map((r) => [r.label, r.value]));
+    const byLabel = Object.fromEntries(
+      result.rows.map((r) => [r.label, r.value]),
+    );
     expect(byLabel['Quarantined (24h)']).toBe('1');
   });
 });

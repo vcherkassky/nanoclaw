@@ -6,10 +6,21 @@ import type { StatusContribution } from '../types.js';
 describe('renderTelegramStatus', () => {
   it('renders header + each bucket in input order', () => {
     const contributions: StatusContribution[] = [
-      { bucket: 'channels', title: '📡 Channels', rows: [{ label: 'a', value: 'b' }] },
-      { bucket: 'email', title: '📧 Email', rows: [{ label: 'c', value: 'd' }] },
+      {
+        bucket: 'channels',
+        title: '📡 Channels',
+        rows: [{ label: 'a', value: 'b' }],
+      },
+      {
+        bucket: 'email',
+        title: '📧 Email',
+        rows: [{ label: 'c', value: 'd' }],
+      },
     ];
-    const out = renderTelegramStatus(contributions, new Date('2026-06-28T08:00:00.000Z'));
+    const out = renderTelegramStatus(
+      contributions,
+      new Date('2026-06-28T08:00:00.000Z'),
+    );
     expect(out).toContain('📊 NANOCLAW STATUS');
     expect(out).toContain('2026-06-28');
     expect(out).toContain('📡 Channels');

@@ -20,7 +20,13 @@ beforeEach(() => _initTestDatabase());
 
 describe('status integration', () => {
   it('seeds DB and produces a pinned-message text containing every section', async () => {
-    storeChatMetadata('tg:1', '2026-06-28T08:00:00.000Z', 'Main', 'telegram', false);
+    storeChatMetadata(
+      'tg:1',
+      '2026-06-28T08:00:00.000Z',
+      'Main',
+      'telegram',
+      false,
+    );
     storeMessage({
       id: 'm1',
       chat_jid: 'tg:1',
@@ -80,7 +86,10 @@ describe('status integration', () => {
     });
 
     const results = await mgr.collectAll();
-    const text = renderTelegramStatus(results, new Date('2026-06-28T09:00:00.000Z'));
+    const text = renderTelegramStatus(
+      results,
+      new Date('2026-06-28T09:00:00.000Z'),
+    );
     for (const marker of [
       '📊 NANOCLAW STATUS',
       '📡 Channels & Connections',
