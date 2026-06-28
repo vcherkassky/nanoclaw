@@ -35,6 +35,7 @@ src/status/
 │   ├── channels.ts
 │   ├── email.ts
 │   ├── agent-runs.ts
+│   ├── model-proxy.ts
 │   ├── scheduled.ts
 │   └── system.ts
 └── renderers/
@@ -47,7 +48,7 @@ src/status/
 
 ```ts
 export interface StatusContribution {
-  bucket: 'channels' | 'email' | 'agent' | 'tasks' | 'system';
+  bucket: 'channels' | 'email' | 'agent' | 'proxy' | 'tasks' | 'system';
   title: string;                              // e.g. "📡 Channels & Connections"
   rows: Array<{ label: string; value: string }>;
   warn?: string;                              // optional one-line health flag
@@ -87,12 +88,27 @@ This mirrors NanoClaw's existing optional-capability pattern on `Channel` (`setT
 
 | Metric | Source | Computation |
 |---|---|---|
-| Last run | new `agent_runs` table | `MAX(started_at) GROUP BY group_folder`, then most recent overall |
-| Model | env `ANTHROPIC_MODEL` (or "(default)") | Read at digest time |
-| Last session context size | existing `estimateSessionTokens()` | Call on active group's session file |
+| Total runs (24h) | new `agent_runs` table | `COUNT WHERE started_at > now-1d` |
+| Runs by group (24h) | `agent_runs` | `SELECT group_folder, COUNT(*) ... GROUP BY group_folder ORDER BY 2 DESC` |
+| Runs by model (24h) | `agent_runs` | `SELECT model, COUNT(*) ... GROUP BY model` |
+| Last run | `agent_runs` | `MAX(started_at)`, formatted via `formatRelativeTime` |
+| Last session context size | existing `estimateSessionTokens()` | Call on the active main-group session file |
 | Last container duration | `agent_runs.duration_ms` | Formatted via `formatDuration` |
 | Last exit code | `agent_runs.exit_code` | Render ✓ if 0, ✗ otherwise |
 | Container crashes (24h) | `agent_runs` | `COUNT WHERE exit_code != 0 AND started_at > now-1d` |
+
+### 🔀 Model proxy (Ollama)
+
+The local Ollama proxy (`src/ollama-proxy.ts`) enforces a single-model invariant for the whole process. Surface its state so the digest reveals model thrashing or proxy issues.
+
+| Metric | Source | Computation |
+|---|---|---|
+| Currently loaded model | `OllamaProxy.currentModel` | In-memory getter on the proxy instance |
+| Evictions (24h) | new in-memory counter on `OllamaProxy` | Incremented in `evict()`; resets on process restart (acceptable, daily cadence) |
+| Total requests proxied (24h) | new in-memory counter on `OllamaProxy` | Incremented per inbound request |
+| Last eviction timestamp | new in-memory field on `OllamaProxy` | Set in `evict()`, formatted via `formatRelativeTime` |
+
+Implementation note: add a `getStats(): { currentModel, evictions, requests, lastEvictionAt }` method on `OllamaProxy`. The `ModelProxyProvider` reads it; no schema change. Counters reset on restart — fine for a daily digest. If long-horizon trends matter later, persist via the same `agent_runs`-style approach.
 
 ### ⏱ Scheduled tasks
 
@@ -209,7 +225,8 @@ One test file per module, following the existing `*.test.ts` convention.
 | `src/status/scheduler.test.ts` | Next fire time across DST/midnight; backfills if start-of-day fire was missed; respects `STATUS_ENABLED=false`; fires exactly once per day |
 | `src/status/providers/channels.test.ts` | Each row reflects `isConnected()`; 24h volume window correct; `router_state` lookup for `last_poll` |
 | `src/status/providers/email.test.ts` | Counts JSONL quarantine entries within window; missing file handled; surfaces `errorBucket` counts |
-| `src/status/providers/agent-runs.test.ts` | Reads from `agent_runs`; empty-table case; 24h crash aggregation correct |
+| `src/status/providers/agent-runs.test.ts` | Reads from `agent_runs`; empty-table case; 24h crash aggregation correct; per-group and per-model counts |
+| `src/status/providers/model-proxy.test.ts` | Reads `OllamaProxy.getStats()`; renders currentModel / evictions / requests / lastEvictionAt; handles never-evicted case (lastEvictionAt = null) |
 | `src/status/providers/scheduled.test.ts` | Active count, next-3 ordering, 24h failures, last success |
 | `src/status/providers/system.test.ts` | Uptime/memory/version reflect `process.*`; version cached from `package.json` at construction |
 | `src/status/renderers/telegram.test.ts` | Renders fixture contributions to expected text; preserves bucket order; truncates if over 4096 chars (Telegram limit); duration/bytes/relative-time formatting respected |
@@ -236,10 +253,16 @@ Channel-side: `src/channels/telegram.test.ts` gains tests for `sendMessageReturn
   Last poll         8m ago
 
 🤖 Agent Runs
-  Last run          3m ago (main · claude-opus-4-7)
-  Duration          35m 14s · exit ✓
+  Total (24h)       42 · 38 main · 4 pa_email_processor
+  By model (24h)    claude-opus-4-7 38 · gemma4:26b 4
+  Last run          3m ago · exit ✓ · 35m 14s
   Session context   ~12.4k tokens
   Crashes (24h)     0
+
+🔀 Model Proxy
+  Loaded            gemma4:26b
+  Evictions (24h)   2 · last 1h 12m ago
+  Requests (24h)    287
 
 ⏱ Scheduled Tasks
   Active            7
