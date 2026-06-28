@@ -13,11 +13,12 @@ export function extractSessionCommand(
   text = text.replace(triggerPattern, '').trim();
   if (text === '/compact') return '/compact';
   if (text === '/context') return '/context';
+  if (text === '/status') return '/status';
   return null;
 }
 
 /** Commands that are handled entirely on the host (no agent invocation). */
-const HOST_HANDLED = new Set(['/context']);
+const HOST_HANDLED = new Set(['/context', '/status']);
 
 /**
  * Check if a session command sender is authorized.
@@ -51,6 +52,8 @@ export interface SessionCommandDeps {
   canSenderInteract: (msg: NewMessage) => boolean;
   /** Returns a human-readable summary of current session context size. Used by /context. */
   describeContext?: () => string;
+  /** Triggers an immediate status digest refresh. Used by /status. */
+  refreshStatus?: () => Promise<void>;
 }
 
 function resultToText(result: string | object | null | undefined): string {
@@ -106,12 +109,25 @@ export async function handleSessionCommand(opts: {
   // AUTHORIZED: process pre-compact messages first, then run the command
   logger.info({ group: groupName, command }, 'Session command');
 
-  // Host-handled commands (e.g. /context) don't need the agent.
+  // Host-handled commands (e.g. /context, /status) don't need the agent.
   if (HOST_HANDLED.has(command)) {
-    const text = deps.describeContext
-      ? deps.describeContext()
-      : 'Context inspection is not available in this build.';
-    await deps.sendMessage(text);
+    if (command === '/status') {
+      if (deps.refreshStatus) {
+        try {
+          await deps.refreshStatus();
+        } catch (err) {
+          logger.warn({ err }, '/status: refreshStatus failed');
+          await deps.sendMessage('Status refresh failed; see logs.');
+        }
+      } else {
+        await deps.sendMessage('Status digest is not configured.');
+      }
+    } else {
+      const text = deps.describeContext
+        ? deps.describeContext()
+        : 'Context inspection is not available in this build.';
+      await deps.sendMessage(text);
+    }
     deps.advanceCursor(cmdMsg.timestamp);
     return { handled: true, success: true };
   }
