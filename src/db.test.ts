@@ -3,15 +3,21 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   _initTestDatabase,
   clearEmailAttempt,
+  countAgentCrashesSince,
+  countAgentRunsByGroupSince,
+  countAgentRunsByModelSince,
+  countAgentRunsSince,
   createTask,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
   getEmailAttempt,
+  getLastAgentRun,
   getMessagesSince,
   getNewMessages,
   getRecentMessages,
   getTaskById,
+  recordAgentRun,
   recordEmailAttempt,
   setRegisteredGroup,
   storeChatMetadata,
@@ -672,5 +678,136 @@ describe('email_attempts', () => {
 
   it('clearEmailAttempt on a non-existent message_id is a no-op', () => {
     expect(() => clearEmailAttempt('never-existed')).not.toThrow();
+  });
+});
+
+describe('agent_runs', () => {
+  beforeEach(() => _initTestDatabase());
+
+  it('records a single agent run', () => {
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-28T08:00:00.000Z',
+      ended_at: '2026-06-28T08:01:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'claude-opus-4-7',
+      error_class: null,
+    });
+    const last = getLastAgentRun();
+    expect(last).toMatchObject({
+      group_folder: 'main',
+      exit_code: 0,
+      duration_ms: 60_000,
+      model: 'claude-opus-4-7',
+    });
+  });
+
+  it('counts runs since a cutoff', () => {
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-28T08:00:00.000Z',
+      ended_at: '2026-06-28T08:01:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'm',
+      error_class: null,
+    });
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-27T08:00:00.000Z',
+      ended_at: '2026-06-27T08:01:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'm',
+      error_class: null,
+    });
+    expect(countAgentRunsSince('2026-06-28T00:00:00.000Z')).toBe(1);
+    expect(countAgentRunsSince('2026-06-26T00:00:00.000Z')).toBe(2);
+  });
+
+  it('counts crashes (exit_code != 0) since a cutoff', () => {
+    recordAgentRun({
+      group_folder: 'g',
+      started_at: '2026-06-28T08:00:00.000Z',
+      ended_at: '2026-06-28T08:01:00.000Z',
+      duration_ms: 1,
+      exit_code: 0,
+      model: 'm',
+      error_class: null,
+    });
+    recordAgentRun({
+      group_folder: 'g',
+      started_at: '2026-06-28T08:05:00.000Z',
+      ended_at: '2026-06-28T08:15:00.000Z',
+      duration_ms: 600_000,
+      exit_code: 137,
+      model: 'm',
+      error_class: 'timeout',
+    });
+    expect(countAgentCrashesSince('2026-06-28T00:00:00.000Z')).toBe(1);
+  });
+
+  it('breaks down runs by group', () => {
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-28T08:00:00.000Z',
+      ended_at: '2026-06-28T08:01:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'm',
+      error_class: null,
+    });
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-28T08:05:00.000Z',
+      ended_at: '2026-06-28T08:06:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'm',
+      error_class: null,
+    });
+    recordAgentRun({
+      group_folder: 'pa',
+      started_at: '2026-06-28T08:10:00.000Z',
+      ended_at: '2026-06-28T08:11:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'm',
+      error_class: null,
+    });
+    expect(countAgentRunsByGroupSince('2026-06-28T00:00:00.000Z')).toEqual({
+      main: 2,
+      pa: 1,
+    });
+  });
+
+  it('breaks down runs by model (null model bucketed as "(default)")', () => {
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-28T08:00:00.000Z',
+      ended_at: '2026-06-28T08:01:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: 'opus',
+      error_class: null,
+    });
+    recordAgentRun({
+      group_folder: 'main',
+      started_at: '2026-06-28T08:05:00.000Z',
+      ended_at: '2026-06-28T08:06:00.000Z',
+      duration_ms: 60_000,
+      exit_code: 0,
+      model: null,
+      error_class: null,
+    });
+    expect(countAgentRunsByModelSince('2026-06-28T00:00:00.000Z')).toEqual({
+      opus: 1,
+      '(default)': 1,
+    });
+  });
+
+  it('returns undefined from getLastAgentRun when the table is empty', () => {
+    expect(getLastAgentRun()).toBeUndefined();
   });
 });

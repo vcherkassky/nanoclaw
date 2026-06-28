@@ -91,6 +91,18 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_email_attempts_next_retry
       ON email_attempts(next_retry_at);
+    CREATE TABLE IF NOT EXISTS agent_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      ended_at TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      exit_code INTEGER NOT NULL,
+      model TEXT,
+      error_class TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_started_at
+      ON agent_runs(started_at);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -719,6 +731,81 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Agent-runs accessors ---
+
+export interface AgentRunRecord {
+  group_folder: string;
+  started_at: string;
+  ended_at: string;
+  duration_ms: number;
+  exit_code: number;
+  model: string | null;
+  error_class: string | null;
+}
+
+export function recordAgentRun(run: AgentRunRecord): void {
+  db.prepare(
+    `INSERT INTO agent_runs (group_folder, started_at, ended_at, duration_ms, exit_code, model, error_class)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    run.group_folder,
+    run.started_at,
+    run.ended_at,
+    run.duration_ms,
+    run.exit_code,
+    run.model,
+    run.error_class,
+  );
+}
+
+export function getLastAgentRun(): AgentRunRecord | undefined {
+  const row = db
+    .prepare(
+      `SELECT group_folder, started_at, ended_at, duration_ms, exit_code, model, error_class
+       FROM agent_runs ORDER BY started_at DESC LIMIT 1`,
+    )
+    .get() as AgentRunRecord | undefined;
+  return row;
+}
+
+export function countAgentRunsSince(cutoffIso: string): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS c FROM agent_runs WHERE started_at > ?`)
+    .get(cutoffIso) as { c: number };
+  return row.c;
+}
+
+export function countAgentCrashesSince(cutoffIso: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM agent_runs WHERE started_at > ? AND exit_code <> 0`,
+    )
+    .get(cutoffIso) as { c: number };
+  return row.c;
+}
+
+export function countAgentRunsByGroupSince(
+  cutoffIso: string,
+): Record<string, number> {
+  const rows = db
+    .prepare(
+      `SELECT group_folder, COUNT(*) AS c FROM agent_runs WHERE started_at > ? GROUP BY group_folder ORDER BY c DESC`,
+    )
+    .all(cutoffIso) as { group_folder: string; c: number }[];
+  return Object.fromEntries(rows.map((r) => [r.group_folder, r.c]));
+}
+
+export function countAgentRunsByModelSince(
+  cutoffIso: string,
+): Record<string, number> {
+  const rows = db
+    .prepare(
+      `SELECT COALESCE(model, '(default)') AS model, COUNT(*) AS c FROM agent_runs WHERE started_at > ? GROUP BY model ORDER BY c DESC`,
+    )
+    .all(cutoffIso) as { model: string; c: number }[];
+  return Object.fromEntries(rows.map((r) => [r.model, r.c]));
 }
 
 // --- JSON migration ---
