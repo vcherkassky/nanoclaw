@@ -47,6 +47,14 @@ describe('extractSessionCommand', () => {
   it('detects /context with trigger prefix', () => {
     expect(extractSessionCommand('@Andy /context', trigger)).toBe('/context');
   });
+
+  it('detects bare /status', () => {
+    expect(extractSessionCommand('/status', trigger)).toBe('/status');
+  });
+
+  it('detects /status with trigger prefix', () => {
+    expect(extractSessionCommand('@Andy /status', trigger)).toBe('/status');
+  });
 });
 
 describe('isSessionCommandAllowed', () => {
@@ -128,6 +136,60 @@ describe('handleSessionCommand', () => {
       '/compact',
       expect.any(Function),
     );
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('handles /status host-side via refreshStatus (no agent invoked, no chat reply)', async () => {
+    const refreshStatus = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({ refreshStatus });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/status')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(refreshStatus).toHaveBeenCalledOnce();
+    expect(deps.runAgent).not.toHaveBeenCalled();
+    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('/status sends a "not configured" message when refreshStatus is missing', async () => {
+    const deps = makeDeps({ refreshStatus: undefined });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/status')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      'Status digest is not configured.',
+    );
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('/status reports failure when refreshStatus throws', async () => {
+    const refreshStatus = vi.fn().mockRejectedValue(new Error('boom'));
+    const deps = makeDeps({ refreshStatus });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/status')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      'Status refresh failed; see logs.',
+    );
+    // Cursor still advances — we treat a logged failure as "handled."
     expect(deps.advanceCursor).toHaveBeenCalledWith('100');
   });
 
