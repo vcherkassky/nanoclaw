@@ -501,3 +501,15 @@ describe('OllamaProxy', () => {
     );
   });
 });
+
+describe('OllamaProxy.getStats', () => {
+  it('starts with zeroed counters and null currentModel', () => {
+    const proxy = new OllamaProxy({ realHost: 'http://localhost:99999' });
+    expect(proxy.getStats()).toEqual({
+      currentModel: null,
+      evictions: 0,
+      requests: 0,
+      lastEvictionAt: null,
+    });
+  });
+});

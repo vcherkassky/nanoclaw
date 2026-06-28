@@ -58,6 +58,9 @@ export class OllamaProxy {
   private realHost: string;
   private fetchFn: typeof fetch;
   private currentModel: string | null = null;
+  private evictionCount = 0;
+  private requestCount = 0;
+  private lastEvictionAt: string | null = null;
   private mutex = new AsyncMutex();
   private server: Server | null = null;
 
@@ -68,6 +71,20 @@ export class OllamaProxy {
 
   getCurrentModel(): string | null {
     return this.currentModel;
+  }
+
+  getStats(): {
+    currentModel: string | null;
+    evictions: number;
+    requests: number;
+    lastEvictionAt: string | null;
+  } {
+    return {
+      currentModel: this.currentModel,
+      evictions: this.evictionCount,
+      requests: this.requestCount,
+      lastEvictionAt: this.lastEvictionAt,
+    };
   }
 
   /**
@@ -96,6 +113,7 @@ export class OllamaProxy {
   }
 
   async handle(req: ProxyRequest): Promise<ProxyResponse> {
+    this.requestCount++;
     if (!MODEL_LOADING_PATHS.has(req.path)) {
       return this.forward(req);
     }
@@ -130,6 +148,8 @@ export class OllamaProxy {
   }
 
   private async evict(model: string): Promise<void> {
+    this.evictionCount++;
+    this.lastEvictionAt = new Date().toISOString();
     logger.info({ model }, 'OllamaProxy: evicting model before swap');
     try {
       await this.fetchFn(`${this.realHost}/api/generate`, {
