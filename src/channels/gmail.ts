@@ -11,6 +11,11 @@ import { google, gmail_v1 } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 
 // isMain flag is used instead of MAIN_GROUP_FOLDER constant
+import {
+  clearEmailAttempt,
+  getEmailAttempt,
+  recordEmailAttempt,
+} from '../db.js';
 import { classifyEmail, sanitizeEmail } from '../email-classifier.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -230,6 +235,53 @@ export class GmailChannel implements Channel {
 
   // --- Private ---
 
+  // After this many failed attempts the email is marked give-up: labeled as
+  // processed if possible and never retried. Backoff between attempts is
+  // exponential starting at 60s.
+  private static readonly MAX_ATTEMPTS = 3;
+  private static readonly BASE_BACKOFF_MS = 60_000;
+
+  /**
+   * Record a processing failure for `messageId` and free the in-memory
+   * dedup slot so the next poll re-evaluates against `email_attempts`.
+   * Returns true if attempts are now exhausted (caller should label as
+   * processed-with-give-up and stop).
+   */
+  private noteFailure(messageId: string, reason: string): boolean {
+    const prior = getEmailAttempt(messageId);
+    const nextCount = (prior?.attempt_count ?? 0) + 1;
+    const exhausted = nextCount >= GmailChannel.MAX_ATTEMPTS;
+    const backoffMs = exhausted
+      ? null
+      : GmailChannel.BASE_BACKOFF_MS * Math.pow(2, nextCount - 1);
+    recordEmailAttempt(messageId, reason, new Date().toISOString(), backoffMs);
+    this.processedIds.delete(messageId);
+    if (exhausted) {
+      logger.warn(
+        { messageId, attempts: nextCount, reason },
+        'Gmail: email exhausted retry budget — giving up',
+      );
+    }
+    return exhausted;
+  }
+
+  /** Apply the processed label so a give-up email stops surfacing in polls. */
+  private async labelAsGivenUp(messageId: string): Promise<void> {
+    if (!this.gmail || !this.processedLabelId) return;
+    try {
+      await this.gmail.users.messages.modify({
+        userId: 'me',
+        id: messageId,
+        requestBody: { addLabelIds: [this.processedLabelId] },
+      });
+    } catch (err) {
+      logger.warn(
+        { messageId, err },
+        'Gmail: failed to label give-up email; will retry labeling next poll',
+      );
+    }
+  }
+
   private buildQuery(): string {
     if (this.opts.labelTracking && this.startDate) {
       const label = this.opts.processedLabel ?? '🤖✅';
@@ -253,8 +305,26 @@ export class GmailChannel implements Channel {
 
       for (const stub of messages) {
         if (!stub.id || this.processedIds.has(stub.id)) continue;
-        this.processedIds.add(stub.id);
 
+        // Honour persistent retry state: skip messages still in backoff or
+        // marked give-up. Without this, restarting NanoClaw would re-fire
+        // every previously-failed email immediately.
+        const attempt = getEmailAttempt(stub.id);
+        if (attempt) {
+          if (attempt.next_retry_at === null) {
+            // Gave up earlier; label should have filtered this out at the
+            // Gmail query layer, but be defensive.
+            this.processedIds.add(stub.id);
+            continue;
+          }
+          if (new Date(attempt.next_retry_at).getTime() > Date.now()) {
+            // Still in backoff window. Don't add to processedIds so the
+            // next poll re-evaluates after the window expires.
+            continue;
+          }
+        }
+
+        this.processedIds.add(stub.id);
         await this.processMessage(stub.id);
       }
 
@@ -539,8 +609,14 @@ export class GmailChannel implements Channel {
       const classification = await classifyEmail(sanitized);
 
       if ('retry' in classification) {
-        // Classifier unavailable (Ollama down) — un-track so next poll retries
-        this.processedIds.delete(messageId);
+        // Classifier unavailable (Ollama down) — record attempt and re-poll
+        // after backoff. If attempts are exhausted, label as processed and
+        // stop; better to skip one stubborn email than burn the GPU forever.
+        const exhausted = this.noteFailure(
+          messageId,
+          `classifier_retry: ${classification.reason}`,
+        );
+        if (exhausted) await this.labelAsGivenUp(messageId);
         logger.warn(
           { messageId, reason: classification.reason },
           'Gmail: classifier unavailable, email will be retried',
@@ -617,10 +693,14 @@ export class GmailChannel implements Channel {
       if (this.opts.useClassifier && this.opts.onEmailForProcessing) {
         try {
           await this.opts.onEmailForProcessing(emailMsg);
-        } catch {
-          // Agent failed — remove from processedIds so next poll retries
-          this.processedIds.delete(messageId);
-          return; // Skip label — email will be re-delivered next poll
+        } catch (err) {
+          // Agent failed — most often a 10-min container SIGKILL because
+          // Ollama prefill of an oversized prompt blew the budget. Record
+          // the attempt; on exhausted, label as processed so the loop ends.
+          const reason = err instanceof Error ? err.message : String(err);
+          const exhausted = this.noteFailure(messageId, `agent: ${reason}`);
+          if (exhausted) await this.labelAsGivenUp(messageId);
+          return; // Skip label — email will be re-delivered after backoff
         }
       } else {
         this.opts.onMessage(mainJid, emailMsg);
@@ -639,13 +719,18 @@ export class GmailChannel implements Channel {
             id: messageId,
             requestBody: { addLabelIds: [labelId] },
           });
+          // Success — drop any prior failure state.
+          clearEmailAttempt(messageId);
         } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
           logger.warn(
             { messageId, err },
             'Gmail: failed to apply tracking label — will retry on next poll',
           );
-          this.processedIds.delete(messageId);
+          this.noteFailure(messageId, `label_apply: ${reason}`);
         }
+      } else {
+        clearEmailAttempt(messageId);
       }
     } else if (!quarantined) {
       // PA channel: mark as read (quarantined emails don't reach here without labelTracking)
@@ -655,6 +740,7 @@ export class GmailChannel implements Channel {
           id: messageId,
           requestBody: { removeLabelIds: ['UNREAD'] },
         });
+        clearEmailAttempt(messageId);
       } catch (err) {
         logger.warn({ messageId, err }, 'Failed to mark email as read');
       }

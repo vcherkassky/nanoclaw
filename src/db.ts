@@ -82,6 +82,15 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS email_attempts (
+      message_id TEXT PRIMARY KEY,
+      attempt_count INTEGER NOT NULL,
+      last_attempt_at TEXT NOT NULL,
+      next_retry_at TEXT,
+      last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_attempts_next_retry
+      ON email_attempts(next_retry_at);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -528,6 +537,65 @@ export function setRouterState(key: string, value: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run(key, value);
+}
+
+// --- Email-attempts accessors ---
+//
+// Tracks per-message failure state for the Gmail processing pipeline. The
+// in-memory processedIds set on GmailChannel covers dedup within a process
+// lifetime; this table makes the dedup AND backoff state survive restarts so
+// a stuck email doesn't spawn a fresh agent every poll forever.
+//
+// `next_retry_at = NULL` means "give up, do not retry" — set by callers that
+// have exhausted the attempt cap and applied a give-up label.
+
+export interface EmailAttempt {
+  message_id: string;
+  attempt_count: number;
+  last_attempt_at: string;
+  next_retry_at: string | null;
+  last_error: string | null;
+}
+
+export function getEmailAttempt(messageId: string): EmailAttempt | undefined {
+  const row = db
+    .prepare(
+      'SELECT message_id, attempt_count, last_attempt_at, next_retry_at, last_error FROM email_attempts WHERE message_id = ?',
+    )
+    .get(messageId) as EmailAttempt | undefined;
+  return row;
+}
+
+/**
+ * Insert or update the attempt row for `messageId`. Each call increments
+ * `attempt_count` by 1. `backoffMs` is the delay added to `attemptAt` to
+ * compute `next_retry_at`; pass `null` to mark this email as "do not retry."
+ */
+export function recordEmailAttempt(
+  messageId: string,
+  error: string,
+  attemptAt: string,
+  backoffMs: number | null,
+): void {
+  const existing = getEmailAttempt(messageId);
+  const attemptCount = (existing?.attempt_count ?? 0) + 1;
+  const nextRetryAt =
+    backoffMs === null
+      ? null
+      : new Date(new Date(attemptAt).getTime() + backoffMs).toISOString();
+  db.prepare(
+    `INSERT INTO email_attempts (message_id, attempt_count, last_attempt_at, next_retry_at, last_error)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(message_id) DO UPDATE SET
+       attempt_count = excluded.attempt_count,
+       last_attempt_at = excluded.last_attempt_at,
+       next_retry_at = excluded.next_retry_at,
+       last_error = excluded.last_error`,
+  ).run(messageId, attemptCount, attemptAt, nextRetryAt, error);
+}
+
+export function clearEmailAttempt(messageId: string): void {
+  db.prepare('DELETE FROM email_attempts WHERE message_id = ?').run(messageId);
 }
 
 // --- Session accessors ---

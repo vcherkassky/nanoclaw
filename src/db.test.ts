@@ -2,14 +2,17 @@ import { describe, it, expect, beforeEach } from 'vitest';
 
 import {
   _initTestDatabase,
+  clearEmailAttempt,
   createTask,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getEmailAttempt,
   getMessagesSince,
   getNewMessages,
   getRecentMessages,
   getTaskById,
+  recordEmailAttempt,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
@@ -627,5 +630,47 @@ describe('getRecentMessages', () => {
     // Should be the 20 newest, in chronological order
     expect(msgs[0].content).toBe('message 5');
     expect(msgs[19].content).toBe('message 24');
+  });
+});
+
+describe('email_attempts', () => {
+  it('returns undefined when no attempt is recorded', () => {
+    expect(getEmailAttempt('m1')).toBeUndefined();
+  });
+
+  it('records a new attempt with attempt_count=1', () => {
+    recordEmailAttempt('m1', 'timeout', '2026-06-28T10:00:00.000Z', 60_000);
+    const a = getEmailAttempt('m1')!;
+    expect(a.message_id).toBe('m1');
+    expect(a.attempt_count).toBe(1);
+    expect(a.last_attempt_at).toBe('2026-06-28T10:00:00.000Z');
+    expect(a.last_error).toBe('timeout');
+    // 60s after the recorded time
+    expect(a.next_retry_at).toBe('2026-06-28T10:01:00.000Z');
+  });
+
+  it('increments attempt_count on repeated record calls', () => {
+    recordEmailAttempt('m1', 'err1', '2026-06-28T10:00:00.000Z', 60_000);
+    recordEmailAttempt('m1', 'err2', '2026-06-28T10:01:30.000Z', 120_000);
+    const a = getEmailAttempt('m1')!;
+    expect(a.attempt_count).toBe(2);
+    expect(a.last_error).toBe('err2');
+    expect(a.next_retry_at).toBe('2026-06-28T10:03:30.000Z');
+  });
+
+  it('passes null backoff to mean "do not retry"', () => {
+    recordEmailAttempt('m1', 'gave_up', '2026-06-28T10:00:00.000Z', null);
+    const a = getEmailAttempt('m1')!;
+    expect(a.next_retry_at).toBeNull();
+  });
+
+  it('clearEmailAttempt removes the row', () => {
+    recordEmailAttempt('m1', 'x', '2026-06-28T10:00:00.000Z', 60_000);
+    clearEmailAttempt('m1');
+    expect(getEmailAttempt('m1')).toBeUndefined();
+  });
+
+  it('clearEmailAttempt on a non-existent message_id is a no-op', () => {
+    expect(() => clearEmailAttempt('never-existed')).not.toThrow();
   });
 });
