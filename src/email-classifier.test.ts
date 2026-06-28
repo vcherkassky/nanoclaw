@@ -163,6 +163,59 @@ describe('sanitizeEmail', () => {
     // in the rendered email — strong signal on its own.
     expect(result!.body.toUpperCase()).toContain('HIDDEN');
   });
+
+  it('shortens long tracking URLs but preserves the host for visibility', () => {
+    const longUrl =
+      'https://url9968.mail.instructables.com/ls/click?upn=u001.' +
+      'A'.repeat(400);
+    const result = sanitizeEmail(
+      'id1',
+      'a@b.com',
+      'S',
+      `Read more: ${longUrl} thanks.`,
+    );
+    expect(result!.body).not.toContain('A'.repeat(50));
+    expect(result!.body).toContain('url9968.mail.instructables.com');
+    expect(result!.body).toContain('[link:');
+  });
+
+  it('keeps short URLs intact', () => {
+    const result = sanitizeEmail(
+      'id1',
+      'a@b.com',
+      'S',
+      'See https://example.com/post/42 for details.',
+    );
+    expect(result!.body).toContain('https://example.com/post/42');
+  });
+
+  it('shrinks a body full of tracking URLs well under the cap', () => {
+    // Synthetic version of the Instructables case: many ~500-char tracking
+    // links interspersed with a small amount of real text.
+    const tracker = (n: number) =>
+      `https://url${n}.mail.example.com/ls/click?upn=u001.` + 'X'.repeat(450);
+    const bigBody =
+      'Newsletter\n\n' +
+      Array.from({ length: 30 }, (_, i) => `Item ${i}: ${tracker(i)}`).join(
+        '\n',
+      ) +
+      '\n\nUnsubscribe';
+    const result = sanitizeEmail('id1', 'a@b.com', 'S', bigBody);
+    // Without stripping, this would blow past 8000 chars and force truncation
+    // that drops the trailing "Unsubscribe" footer. With stripping, the
+    // structure is preserved and the body fits comfortably.
+    expect(result!.body.length).toBeLessThan(4000);
+    expect(result!.body).toContain('Unsubscribe');
+  });
+
+  it('accepts a custom maxBodyChars cap for callers that need more headroom', () => {
+    const body = 'A'.repeat(20000);
+    const result = sanitizeEmail('id1', 'a@b.com', 'S', body, {
+      maxBodyChars: 12000,
+    });
+    expect(result!.body.length).toBeLessThanOrEqual(12000);
+    expect(result!.body.length).toBeGreaterThan(8000);
+  });
 });
 
 // ---------------------------------------------------------------------------

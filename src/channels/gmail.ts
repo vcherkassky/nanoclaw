@@ -585,7 +585,26 @@ export class GmailChannel implements Channel {
     }
 
     if (!quarantined) {
-      const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
+      // Sanitize before delivery — strips HTML tags, JS schemes, event
+      // handlers, and shortens tracking URLs. Without this, newsletter HTML
+      // (often 50kB+ of tracking links) gets prefilled into the agent's
+      // Ollama context and bursts the timeout. 12k char cap leaves headroom
+      // beyond the classifier's tighter 8k cap.
+      const sanitizedForAgent = sanitizeEmail(
+        messageId,
+        senderEmail,
+        subject,
+        body,
+        { maxBodyChars: 12000 },
+      );
+      if (!sanitizedForAgent) {
+        logger.warn(
+          { messageId, senderEmail },
+          'Gmail: email failed sanitization on delivery, skipping',
+        );
+        return;
+      }
+      const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${sanitizedForAgent.subject}\n\n${sanitizedForAgent.body}`;
       const emailMsg = {
         id: messageId,
         chat_jid: mainJid,

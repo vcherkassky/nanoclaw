@@ -69,6 +69,26 @@ const SandboxOutputSchema = z.object({
 // ---------------------------------------------------------------------------
 
 /**
+ * Replace long URLs with `[link:host]`, preserving the domain as a signal.
+ * Tracking/redirect URLs are typically 200-800 chars with encoded payloads;
+ * legitimate ones are usually well under 80. Shrinking these is both a token-
+ * budget win and a noise-reduction win for the classifier.
+ */
+function stripTrackingUrls(text: string): string {
+  return text.replace(/https?:\/\/[^\s\]\)>]+/g, (url) => {
+    if (url.length <= 80) return url;
+    try {
+      const host = new URL(url).host;
+      return `[link:${host}]`;
+    } catch {
+      return '[link]';
+    }
+  });
+}
+
+const DEFAULT_MAX_BODY_CHARS = 8000;
+
+/**
  * Sanitize raw email fields before they reach the classifier LLM.
  * Returns null if the email ID is structurally invalid (reject entirely).
  */
@@ -77,6 +97,7 @@ export function sanitizeEmail(
   from: string,
   subject: string,
   body: string,
+  options: { maxBodyChars?: number } = {},
 ): SanitizedEmail | null {
   // Validate and sanitize email ID
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
@@ -107,18 +128,21 @@ export function sanitizeEmail(
   // so the classifier sees both the payload AND that it was concealed. The
   // marker is then a strong on-its-own signal (legitimate emails should never
   // contain hidden text).
-  const cleanBody = body
-    .replace(
-      /<!--([\s\S]*?)-->/g,
-      (_match, inner: string) => ` [HIDDEN-TEXT: ${inner.trim()}] `,
-    )
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/javascript:/gi, '')
-    .replace(/on\w+\s*=/gi, '')
+  const maxBodyChars = options.maxBodyChars ?? DEFAULT_MAX_BODY_CHARS;
+  const cleanBody = stripTrackingUrls(
+    body
+      .replace(
+        /<!--([\s\S]*?)-->/g,
+        (_match, inner: string) => ` [HIDDEN-TEXT: ${inner.trim()}] `,
+      )
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/javascript:/gi, '')
+      .replace(/on\w+\s*=/gi, ''),
+  )
     .replace(/[^\x20-\x7E\n\r\t\u00A0-\uFFFF]/g, '')
     .replace(/\s{3,}/g, '\n')
     .trim()
-    .slice(0, 8000);
+    .slice(0, maxBodyChars);
 
   return { id, from: senderEmail, subject: cleanSubject, body: cleanBody };
 }
