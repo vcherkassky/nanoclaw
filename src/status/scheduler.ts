@@ -61,6 +61,7 @@ export class StatusScheduler {
     } catch (err) {
       logger.warn({ err }, 'StatusScheduler: onFire threw');
     }
+    this.scheduleNext();
   }
 
   private todayFireTime(nowMs: number): number {
