@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   estimateSessionTokens,
+  findLatestSessionId,
   formatSessionEstimate,
 } from './context-monitor.js';
 
@@ -154,6 +155,99 @@ describe('estimateSessionTokens', () => {
       dataDir: path.join(tmpDir, 'data'),
     });
     expect(b.exists).toBe(false);
+  });
+});
+
+describe('findLatestSessionId', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-monitor-latest-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeSession(
+    folder: string,
+    sessionId: string,
+    mtimeMs: number,
+    body = 'x',
+  ): void {
+    const dir = path.join(
+      tmpDir,
+      'data',
+      'sessions',
+      folder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${sessionId}.jsonl`);
+    fs.writeFileSync(filePath, body);
+    fs.utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
+  }
+
+  it('returns null when the session directory does not exist', () => {
+    expect(
+      findLatestSessionId('does-not-exist', {
+        dataDir: path.join(tmpDir, 'data'),
+      }),
+    ).toBeNull();
+  });
+
+  it('returns null when the directory has no jsonl files', () => {
+    fs.mkdirSync(
+      path.join(
+        tmpDir,
+        'data',
+        'sessions',
+        'g',
+        '.claude',
+        'projects',
+        '-workspace-group',
+      ),
+      { recursive: true },
+    );
+    expect(
+      findLatestSessionId('g', { dataDir: path.join(tmpDir, 'data') }),
+    ).toBeNull();
+  });
+
+  it('returns the session id of the most recently modified jsonl', () => {
+    writeSession('g', 'older', 1_700_000_000_000);
+    writeSession('g', 'newer', 1_700_000_100_000);
+    expect(
+      findLatestSessionId('g', { dataDir: path.join(tmpDir, 'data') }),
+    ).toBe('newer');
+  });
+
+  it('ignores non-jsonl files', () => {
+    writeSession('g', 'only-real', 1_700_000_000_000);
+    const dir = path.join(
+      tmpDir,
+      'data',
+      'sessions',
+      'g',
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.writeFileSync(path.join(dir, 'note.txt'), 'x');
+    fs.utimesSync(path.join(dir, 'note.txt'), 9_999_999, 9_999_999);
+    expect(
+      findLatestSessionId('g', { dataDir: path.join(tmpDir, 'data') }),
+    ).toBe('only-real');
+  });
+
+  it('rejects unsafe groupFolder', () => {
+    expect(
+      findLatestSessionId('../escape', {
+        dataDir: path.join(tmpDir, 'data'),
+      }),
+    ).toBeNull();
   });
 });
 

@@ -29,6 +29,7 @@ import { renderTelegramStatus } from './status/renderers/telegram.js';
 import { StatusScheduler } from './status/scheduler.js';
 import {
   estimateSessionTokens,
+  findLatestSessionId,
   formatSessionEstimate,
 } from './context-monitor.js';
 import { startCredentialProxy } from './credential-proxy.js';
@@ -477,6 +478,26 @@ async function runAgent(
     if (!noSession && output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
+    } else if (!noSession) {
+      // Fallback: SDK rotates session IDs via streaming markers in the
+      // container's stdout. If the container was SIGKILL'd or crashed before
+      // those markers reached us, output.newSessionId is undefined and our
+      // tracked session ID would be stuck on the previous (now-orphaned)
+      // file. Reconcile by scanning the on-disk session directory for the
+      // newest jsonl. Only update if it differs — avoids needless DB writes.
+      const onDisk = findLatestSessionId(group.folder);
+      if (onDisk && onDisk !== sessions[group.folder]) {
+        logger.info(
+          {
+            group: group.folder,
+            from: sessions[group.folder] ?? null,
+            to: onDisk,
+          },
+          'Recovered session id from disk (streaming marker missed)',
+        );
+        sessions[group.folder] = onDisk;
+        setSession(group.folder, onDisk);
+      }
     }
 
     if (output.status === 'error') {

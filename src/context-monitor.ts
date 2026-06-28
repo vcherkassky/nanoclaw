@@ -126,6 +126,64 @@ function sessionFilePath(
   );
 }
 
+function sessionDirPath(
+  dataDir: string,
+  groupFolder: string,
+): string | null {
+  if (!SAFE_NAME.test(groupFolder)) return null;
+  return path.join(
+    dataDir,
+    'sessions',
+    groupFolder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+  );
+}
+
+/**
+ * Find the most recently modified session JSONL file for a group and return
+ * its session ID (filename without `.jsonl`). Returns `null` if the directory
+ * doesn't exist or has no `.jsonl` files.
+ *
+ * Used as a defensive reconciliation: the SDK communicates new session IDs via
+ * streaming markers, which we miss if the container is SIGKILL'd. Scanning the
+ * directory after each container run lets us recover the latest session ID
+ * even when those markers never arrived.
+ */
+export function findLatestSessionId(
+  groupFolder: string,
+  opts: { dataDir?: string } = {},
+): string | null {
+  const dataDir = opts.dataDir ?? DATA_DIR;
+  const dir = sessionDirPath(dataDir, groupFolder);
+  if (!dir) return null;
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  let bestSessionId: string | null = null;
+  let bestMtimeMs = -1;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (!entry.name.endsWith('.jsonl')) continue;
+    const sessionId = entry.name.slice(0, -'.jsonl'.length);
+    if (!SAFE_NAME.test(sessionId)) continue;
+    try {
+      const stat = fs.statSync(path.join(dir, entry.name));
+      if (stat.mtimeMs > bestMtimeMs) {
+        bestMtimeMs = stat.mtimeMs;
+        bestSessionId = sessionId;
+      }
+    } catch {
+      // ignore unreadable files
+    }
+  }
+  return bestSessionId;
+}
+
 export function estimateSessionTokens(
   sessionId: string,
   groupFolder: string,
