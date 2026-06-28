@@ -783,9 +783,14 @@ export function countAgentRunsSince(cutoffIso: string): number {
 }
 
 export function countAgentCrashesSince(cutoffIso: string): number {
+  // error_class is the source of truth for failure semantics; exit_code alone
+  // would count idle-reaped containers that produced output (recorded with
+  // non-zero exit_code but error_class = null) as crashes. Both 'crash'
+  // (non-zero exit, agent never finished) and 'timeout' (no streaming output)
+  // count as failures.
   const row = db
     .prepare(
-      `SELECT COUNT(*) AS c FROM agent_runs WHERE started_at > ? AND exit_code <> 0`,
+      `SELECT COUNT(*) AS c FROM agent_runs WHERE started_at > ? AND error_class IS NOT NULL`,
     )
     .get(cutoffIso) as { c: number };
   return row.c;

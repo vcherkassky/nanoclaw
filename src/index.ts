@@ -991,12 +991,13 @@ async function main(): Promise<void> {
                 return;
               }
               // Fall through: pin was deleted by user, recreate.
-              logger.info(
-                'STATUS: pinned message gone, recreating',
-              );
+              logger.info('STATUS: pinned message gone, recreating');
             }
           }
-          const newId = await telegramCh!.sendMessageReturningId!(mainJid, text);
+          const newId = await telegramCh!.sendMessageReturningId!(
+            mainJid,
+            text,
+          );
           await telegramCh!.pinMessage!(mainJid, newId);
           setRouterState(pinnedKey, newId);
           setRouterState('status_last_refresh_ts', new Date().toISOString());
@@ -1004,10 +1005,14 @@ async function main(): Promise<void> {
 
         refreshStatus = doRefresh;
 
+        // Date.getTimezoneOffset() returns minutes WEST of UTC (positive
+        // for behind UTC). The scheduler wants minutes EAST of UTC.
+        const tzOffsetMinutes = -new Date().getTimezoneOffset();
         const scheduler = new StatusScheduler({
           hour: STATUS_REFRESH_HOUR,
           minute: STATUS_REFRESH_MINUTE,
           onFire: doRefresh,
+          timezoneOffsetMinutes: tzOffsetMinutes,
         });
         scheduler.start();
         logger.info(

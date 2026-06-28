@@ -726,7 +726,8 @@ describe('agent_runs', () => {
     expect(countAgentRunsSince('2026-06-26T00:00:00.000Z')).toBe(2);
   });
 
-  it('counts crashes (exit_code != 0) since a cutoff', () => {
+  it('counts only runs with non-null error_class (timeouts + crashes, not idle-reaped)', () => {
+    // Success: no failure.
     recordAgentRun({
       group_folder: 'g',
       started_at: '2026-06-28T08:00:00.000Z',
@@ -736,6 +737,18 @@ describe('agent_runs', () => {
       model: 'm',
       error_class: null,
     });
+    // Idle-reaped: container hit timeout but agent already streamed output;
+    // exit_code is non-zero but error_class is null. NOT a crash.
+    recordAgentRun({
+      group_folder: 'g',
+      started_at: '2026-06-28T08:02:00.000Z',
+      ended_at: '2026-06-28T08:12:00.000Z',
+      duration_ms: 600_000,
+      exit_code: 137,
+      model: 'm',
+      error_class: null,
+    });
+    // Real timeout: no streaming output before SIGKILL.
     recordAgentRun({
       group_folder: 'g',
       started_at: '2026-06-28T08:05:00.000Z',
@@ -745,7 +758,17 @@ describe('agent_runs', () => {
       model: 'm',
       error_class: 'timeout',
     });
-    expect(countAgentCrashesSince('2026-06-28T00:00:00.000Z')).toBe(1);
+    // Real crash: non-zero exit, agent never finished.
+    recordAgentRun({
+      group_folder: 'g',
+      started_at: '2026-06-28T08:20:00.000Z',
+      ended_at: '2026-06-28T08:20:05.000Z',
+      duration_ms: 5_000,
+      exit_code: 1,
+      model: 'm',
+      error_class: 'crash',
+    });
+    expect(countAgentCrashesSince('2026-06-28T00:00:00.000Z')).toBe(2);
   });
 
   it('breaks down runs by group', () => {
