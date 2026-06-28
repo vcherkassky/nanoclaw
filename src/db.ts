@@ -179,6 +179,11 @@ export function _initTestDatabase(): void {
   createSchema(db);
 }
 
+/** @internal — status providers compose aggregate queries against the raw handle. */
+export function _rawDb(): Database.Database {
+  return db;
+}
+
 /**
  * Store chat metadata only (no message content).
  * Used for all chats to enable group discovery without storing sensitive content.
