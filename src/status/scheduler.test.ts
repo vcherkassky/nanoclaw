@@ -40,6 +40,32 @@ describe('StatusScheduler', () => {
     expect(ran.length).toBe(1);
   });
 
+  it('does NOT re-enter the missed-fire backfill after a successful fire', async () => {
+    // Regression: previously, scheduleNext() ran the backfill check on
+    // every reschedule (including post-fire), which caused an infinite
+    // fire loop the entire day after the first backfill ran. The fix is
+    // that startup uses the backfill, but post-fire always schedules the
+    // next future slot.
+    vi.setSystemTime(new Date('2026-06-28T12:00:00.000Z')); // after 08:00
+    const ran: number[] = [];
+    const sched = new StatusScheduler({
+      hour: 8,
+      minute: 0,
+      onFire: async () => {
+        ran.push(Date.now());
+      },
+      timezoneOffsetMinutes: 0,
+      missedFireWindowMs: 24 * 3_600_000, // large window
+    });
+    sched.start();
+    // Backfill fires once. Without the fix, scheduleNext would re-enter
+    // the backfill path and fire immediately again — and again — until
+    // we ran out of stack or the runner's timer loop tripped.
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1_000); // 10 min
+    expect(ran).toHaveLength(1);
+    sched.stop();
+  });
+
   it('re-arms after firing for the next day', async () => {
     vi.setSystemTime(new Date('2026-06-28T05:00:00.000Z'));
     const ran: number[] = [];

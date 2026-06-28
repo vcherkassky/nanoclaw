@@ -23,7 +23,18 @@ export class StatusScheduler {
 
   start(): void {
     this.stopped = false;
-    this.scheduleNext();
+    // Startup-only backfill: if today's window has passed but is recent
+    // enough, fire immediately. Otherwise schedule the next future slot.
+    const now = Date.now();
+    const today = this.todayFireTime(now);
+    const missedWindow = this.opts.missedFireWindowMs ?? 86_400_000;
+    if (today < now && now - today < missedWindow) {
+      this.timer = setTimeout(() => {
+        void this.fire();
+      }, 0);
+    } else {
+      this.scheduleNextFutureSlot();
+    }
   }
 
   stop(): void {
@@ -34,20 +45,11 @@ export class StatusScheduler {
     }
   }
 
-  private scheduleNext(): void {
+  /** Arm a timer for the NEXT scheduled slot (always in the future). */
+  private scheduleNextFutureSlot(): void {
     if (this.stopped) return;
     const now = Date.now();
-    const missedWindow = this.opts.missedFireWindowMs ?? 86_400_000;
-    const today = this.todayFireTime(now);
-
-    let delayMs: number;
-    if (today < now && now - today < missedWindow) {
-      // Missed today's window — fire immediately as a backfill.
-      delayMs = 0;
-    } else {
-      delayMs = this.nextFireTime(now) - now;
-    }
-
+    const delayMs = this.nextFireTime(now) - now;
     this.timer = setTimeout(() => {
       void this.fire();
     }, delayMs);
@@ -61,7 +63,10 @@ export class StatusScheduler {
     } catch (err) {
       logger.warn({ err }, 'StatusScheduler: onFire threw');
     }
-    this.scheduleNext();
+    // After firing, ALWAYS schedule the next future slot — never re-enter
+    // the missed-fire backfill path. That path is for startup only; running
+    // it after a fire would cause an immediate re-fire loop.
+    this.scheduleNextFutureSlot();
   }
 
   private todayFireTime(nowMs: number): number {
