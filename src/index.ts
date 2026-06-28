@@ -11,9 +11,22 @@ import {
   OLLAMA_REAL_HOST,
   POLL_INTERVAL,
   PUBLIC_INBOX_TARGET_JID,
+  STATUS_ENABLED,
+  STATUS_REFRESH_HOUR,
+  STATUS_REFRESH_MINUTE,
+  STORE_DIR,
   TIMEZONE,
   TRIGGER_PATTERN,
 } from './config.js';
+import { StatusManager } from './status/manager.js';
+import { AgentRunsProvider } from './status/providers/agent-runs.js';
+import { ChannelsProvider } from './status/providers/channels.js';
+import { EmailProvider } from './status/providers/email.js';
+import { ModelProxyProvider } from './status/providers/model-proxy.js';
+import { ScheduledTasksProvider } from './status/providers/scheduled.js';
+import { SystemProvider } from './status/providers/system.js';
+import { renderTelegramStatus } from './status/renderers/telegram.js';
+import { StatusScheduler } from './status/scheduler.js';
 import {
   estimateSessionTokens,
   formatSessionEstimate,
@@ -85,6 +98,7 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 let emailProcessorChain = Promise.resolve();
+let refreshStatus: (() => Promise<void>) | null = null;
 const activeHeadlessContainers = new Set<ChildProcess>();
 const warnedContextSessions = new Set<string>();
 
@@ -241,6 +255,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const e = estimateSessionTokens(sid, group.folder);
         return formatSessionEstimate(e);
       },
+      refreshStatus: refreshStatus ? () => refreshStatus!() : undefined,
     },
   });
   if (cmdResult.handled) return cmdResult.success;
@@ -910,6 +925,105 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  // --- Status digest ---
+  if (STATUS_ENABLED) {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8'),
+    ) as { version: string };
+
+    const mainTelegramEntry = Object.entries(registeredGroups).find(
+      ([jid, g]) => g.isMain === true && jid.startsWith('tg:'),
+    );
+
+    if (mainTelegramEntry) {
+      const [mainJid] = mainTelegramEntry;
+      const telegramCh = channels.find((c) => c.ownsJid(mainJid));
+      const supportsEdit =
+        telegramCh &&
+        typeof telegramCh.editMessage === 'function' &&
+        typeof telegramCh.sendMessageReturningId === 'function' &&
+        typeof telegramCh.pinMessage === 'function';
+
+      if (!supportsEdit) {
+        logger.warn(
+          'STATUS: main Telegram channel lacks editMessage/sendMessageReturningId/pinMessage — status disabled',
+        );
+      } else {
+        const gmailCh = channels.find((c) => c.name === 'gmail') as
+          | { errorBucket?: { errorCount: number } }
+          | undefined;
+        const manager = new StatusManager({
+          providers: [
+            new ChannelsProvider({ channels }),
+            new EmailProvider({
+              quarantinePath: path.join(STORE_DIR, 'email-quarantine.jsonl'),
+              classifierErrorCount: () => gmailCh?.errorBucket?.errorCount ?? 0,
+            }),
+            new AgentRunsProvider(),
+            new ModelProxyProvider({ getStats: () => ollamaProxy.getStats() }),
+            new ScheduledTasksProvider(),
+            new SystemProvider({ version: pkg.version }),
+          ],
+        });
+
+        const doRefresh = async (): Promise<void> => {
+          const contributions = await manager.collectAll();
+          const text = renderTelegramStatus(contributions, new Date());
+          const pinnedKey = `status_pinned_message_id:${mainJid}`;
+          const existingId = getRouterState(pinnedKey);
+          if (existingId) {
+            try {
+              await telegramCh!.editMessage!(mainJid, existingId, text);
+              setRouterState(
+                'status_last_refresh_ts',
+                new Date().toISOString(),
+              );
+              return;
+            } catch (err) {
+              const code = (err as { code?: string }).code;
+              if (code !== 'message_not_found') {
+                logger.warn(
+                  { err },
+                  'STATUS: edit failed (non-recoverable, will skip)',
+                );
+                return;
+              }
+              // Fall through: pin was deleted by user, recreate.
+              logger.info(
+                'STATUS: pinned message gone, recreating',
+              );
+            }
+          }
+          const newId = await telegramCh!.sendMessageReturningId!(mainJid, text);
+          await telegramCh!.pinMessage!(mainJid, newId);
+          setRouterState(pinnedKey, newId);
+          setRouterState('status_last_refresh_ts', new Date().toISOString());
+        };
+
+        refreshStatus = doRefresh;
+
+        const scheduler = new StatusScheduler({
+          hour: STATUS_REFRESH_HOUR,
+          minute: STATUS_REFRESH_MINUTE,
+          onFire: doRefresh,
+        });
+        scheduler.start();
+        logger.info(
+          {
+            hour: STATUS_REFRESH_HOUR,
+            minute: STATUS_REFRESH_MINUTE,
+            mainJid,
+          },
+          'STATUS: scheduler started',
+        );
+      }
+    } else {
+      logger.info(
+        'STATUS: no main Telegram group registered — status disabled',
+      );
+    }
   }
 
   // Start subsystems (independently of connection handler)
