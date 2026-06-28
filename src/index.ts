@@ -865,23 +865,29 @@ async function main(): Promise<void> {
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
     sendNotification: async (text: string, targetJid?: string) => {
-      let jid = targetJid;
-      if (!jid) {
-        const mainEntry = Object.entries(registeredGroups).find(
-          ([, g]) => g.isMain === true,
-        );
-        if (!mainEntry) {
-          logger.warn('sendNotification: no main group found');
-          return;
-        }
-        jid = mainEntry[0];
-      }
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'sendNotification: no channel for jid');
+      const jids = targetJid
+        ? [targetJid]
+        : Object.entries(registeredGroups)
+            .filter(([, g]) => g.isMain === true)
+            .map(([j]) => j);
+      if (jids.length === 0) {
+        logger.warn('sendNotification: no main group found');
         return;
       }
-      await channel.sendMessage(jid, text);
+      await Promise.all(
+        jids.map(async (jid) => {
+          const channel = findChannel(channels, jid);
+          if (!channel) {
+            logger.warn({ jid }, 'sendNotification: no channel for jid');
+            return;
+          }
+          try {
+            await channel.sendMessage(jid, text);
+          } catch (err) {
+            logger.warn({ err, jid }, 'sendNotification: send failed');
+          }
+        }),
+      );
     },
   };
 
