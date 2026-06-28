@@ -90,3 +90,16 @@ export const PUBLIC_INBOX_TARGET_JID =
 // Uses system timezone by default
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// Daily status digest (pinned Telegram message). Disabled if no main
+// Telegram group is registered; explicit STATUS_ENABLED=false also disables.
+export const STATUS_ENABLED =
+  (process.env.STATUS_ENABLED ?? 'true').toLowerCase() !== 'false';
+export const STATUS_REFRESH_HOUR = parseInt(
+  process.env.STATUS_REFRESH_HOUR ?? '8',
+  10,
+);
+export const STATUS_REFRESH_MINUTE = parseInt(
+  process.env.STATUS_REFRESH_MINUTE ?? '0',
+  10,
+);
