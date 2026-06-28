@@ -99,6 +99,12 @@ export interface Channel {
   markRead?(chatJid: string, messages: NewMessage[]): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  /** Send a message and return the platform-native message id. Telegram only in v1. */
+  sendMessageReturningId?(jid: string, text: string): Promise<string>;
+  /** Edit a previously-sent message. */
+  editMessage?(jid: string, messageId: string, text: string): Promise<void>;
+  /** Pin a message in a chat. */
+  pinMessage?(jid: string, messageId: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

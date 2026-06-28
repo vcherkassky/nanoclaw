@@ -445,6 +445,44 @@ export class TelegramChannel implements Channel {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
   }
+
+  async sendMessageReturningId(jid: string, text: string): Promise<string> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = parseInt(jid.replace(/^tg:/, ''), 10);
+    const res = await this.bot.api.sendMessage(numericId, text);
+    return String((res as { message_id: number }).message_id);
+  }
+
+  async editMessage(jid: string, messageId: string, text: string): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = parseInt(jid.replace(/^tg:/, ''), 10);
+    const numericMsg = parseInt(messageId, 10);
+    try {
+      await this.bot.api.editMessageText(numericId, numericMsg, text);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/message is not modified/i.test(msg)) return; // idempotent: text didn't change
+      if (
+        /message to edit not found|message_id is invalid|message can't be edited/i.test(
+          msg,
+        )
+      ) {
+        const e = new Error(msg) as Error & { code: string };
+        e.code = 'message_not_found';
+        throw e;
+      }
+      throw err;
+    }
+  }
+
+  async pinMessage(jid: string, messageId: string): Promise<void> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const numericId = parseInt(jid.replace(/^tg:/, ''), 10);
+    const numericMsg = parseInt(messageId, 10);
+    await this.bot.api.pinChatMessage(numericId, numericMsg, {
+      disable_notification: true,
+    });
+  }
 }
 
 registerChannel('telegram', (opts: ChannelOpts) => {

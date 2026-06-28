@@ -1,10 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import {
-  formatDuration,
-  formatRelativeTime,
-  formatBytes,
-} from './format.js';
+import { formatDuration, formatRelativeTime, formatBytes } from './format.js';
 
 describe('formatDuration', () => {
   it('returns "0s" for zero', () => {
@@ -49,10 +45,7 @@ describe('formatRelativeTime', () => {
   it('renders days ago', () => {
     const now = Date.now();
     expect(
-      formatRelativeTime(
-        new Date(now - 2 * 86_400_000).toISOString(),
-        now,
-      ),
+      formatRelativeTime(new Date(now - 2 * 86_400_000).toISOString(), now),
     ).toBe('2d ago');
   });
   it('renders "never" for null', () => {

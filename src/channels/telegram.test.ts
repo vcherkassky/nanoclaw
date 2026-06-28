@@ -1157,3 +1157,68 @@ describe('TelegramChannel', () => {
     });
   });
 });
+
+describe('TelegramChannel optional methods', () => {
+  function makeChannelWithFakeApi(apiOverrides: Record<string, any> = {}) {
+    const channel = new TelegramChannel('test-token', {
+      onMessage: vi.fn(),
+      onChatMetadata: vi.fn(),
+      registeredGroups: () => ({}),
+    });
+    (channel as any).bot = {
+      api: {
+        sendMessage: vi.fn(async () => ({ message_id: 4242 })),
+        editMessageText: vi.fn(async () => ({})),
+        pinChatMessage: vi.fn(async () => ({})),
+        ...apiOverrides,
+      },
+    };
+    return channel;
+  }
+
+  it('sendMessageReturningId returns the platform message id', async () => {
+    const ch = makeChannelWithFakeApi();
+    const id = await ch.sendMessageReturningId!('tg:123', 'hi');
+    expect(id).toBe('4242');
+  });
+
+  it('editMessage calls Telegraf editMessageText with the right args', async () => {
+    const ch = makeChannelWithFakeApi();
+    await ch.editMessage!('tg:123', '4242', 'new body');
+    const fakeApi = (ch as any).bot.api;
+    expect(fakeApi.editMessageText).toHaveBeenCalledWith(
+      123,
+      4242,
+      'new body',
+    );
+  });
+
+  it('pinMessage calls Telegraf pinChatMessage with the right args', async () => {
+    const ch = makeChannelWithFakeApi();
+    await ch.pinMessage!('tg:123', '4242');
+    const fakeApi = (ch as any).bot.api;
+    expect(fakeApi.pinChatMessage).toHaveBeenCalledWith(123, 4242, {
+      disable_notification: true,
+    });
+  });
+
+  it('editMessage maps "message to edit not found" to a typed error', async () => {
+    const ch = makeChannelWithFakeApi({
+      editMessageText: vi.fn(async () => {
+        throw new Error('Bad Request: message to edit not found');
+      }),
+    });
+    await expect(
+      ch.editMessage!('tg:123', '4242', 'x'),
+    ).rejects.toMatchObject({ code: 'message_not_found' });
+  });
+
+  it('editMessage swallows "message is not modified" (idempotent edit)', async () => {
+    const ch = makeChannelWithFakeApi({
+      editMessageText: vi.fn(async () => {
+        throw new Error('Bad Request: message is not modified');
+      }),
+    });
+    await expect(ch.editMessage!('tg:123', '4242', 'x')).resolves.toBeUndefined();
+  });
+});
