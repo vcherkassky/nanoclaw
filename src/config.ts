@@ -10,6 +10,8 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'PUBLIC_INBOX_TARGET_JID',
+  'MODEL_CONTEXT_LIMITS',
+  'DEFAULT_CONTEXT_LIMIT',
 ]);
 
 export const ASSISTANT_NAME =
@@ -61,6 +63,40 @@ export const OLLAMA_PROXY_PORT = parseInt(
 );
 export const OLLAMA_REAL_HOST =
   process.env.OLLAMA_REAL_HOST || 'http://127.0.0.1:11434';
+/**
+ * Parse a `MODEL_CONTEXT_LIMITS` string into a model→max-tokens map.
+ * Format: comma-separated `model=limit` pairs, e.g.
+ *   "gemma4:26b=32768,claude-opus-4-8=200000"
+ * Model names may contain colons, so we split each entry on the first `=`.
+ * Malformed entries (no `=`, empty key, non-numeric limit) are skipped.
+ */
+export function parseModelContextLimits(
+  raw: string | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!raw) return out;
+  for (const entry of raw.split(',')) {
+    const idx = entry.indexOf('=');
+    if (idx === -1) continue;
+    const key = entry.slice(0, idx).trim();
+    const value = parseInt(entry.slice(idx + 1).trim(), 10);
+    if (!key || Number.isNaN(value)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Per-model context-window sizes, used by /context to show % of limit. */
+export const MODEL_CONTEXT_LIMITS = parseModelContextLimits(
+  process.env.MODEL_CONTEXT_LIMITS || envConfig.MODEL_CONTEXT_LIMITS,
+);
+
+/** Fallback context-window size when a model isn't in MODEL_CONTEXT_LIMITS. */
+export const DEFAULT_CONTEXT_LIMIT = parseInt(
+  process.env.DEFAULT_CONTEXT_LIMIT || envConfig.DEFAULT_CONTEXT_LIMIT || '0',
+  10,
+);
+
 export const CONTEXT_WARN_TOKENS = parseInt(
   process.env.CONTEXT_WARN_TOKENS || '80000',
   10,

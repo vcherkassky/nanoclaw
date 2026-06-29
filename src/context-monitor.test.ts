@@ -146,6 +146,46 @@ describe('estimateSessionTokens', () => {
     expect(fresh.bytes).toBe(800);
   });
 
+  it('extracts actual input tokens (incl. cache) and model from the last assistant turn', () => {
+    const lines = [
+      JSON.stringify({ type: 'user', content: 'hi' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'gemma4:26b', usage: { input_tokens: 1000, output_tokens: 50 } },
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          model: 'gemma4:26b',
+          usage: {
+            input_tokens: 2500,
+            cache_read_input_tokens: 400,
+            cache_creation_input_tokens: 100,
+            output_tokens: 80,
+          },
+        },
+      }),
+    ];
+    makeSessionFile('g', 'sess1', lines.join('\n') + '\n');
+    const r = estimateSessionTokens('sess1', 'g', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    // LAST assistant turn: 2500 + 400 + 100 = 3000
+    expect(r.actualInputTokens).toBe(3000);
+    expect(r.model).toBe('gemma4:26b');
+  });
+
+  it('reports null actual tokens when no assistant usage is present', () => {
+    makeSessionFile('g', 'sess1', JSON.stringify({ type: 'user', content: 'x' }) + '\n');
+    const r = estimateSessionTokens('sess1', 'g', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(r.actualInputTokens).toBeNull();
+    expect(r.model).toBeNull();
+  });
+
   it('rejects path traversal in session id or folder', () => {
     const a = estimateSessionTokens('../escape', 'g', {
       dataDir: path.join(tmpDir, 'data'),
@@ -318,7 +358,49 @@ describe('describeGroupContext', () => {
 });
 
 describe('formatSessionEstimate', () => {
-  it('formats a never-compacted session', () => {
+  it('formats actual usage with percent of the configured model limit', () => {
+    const text = formatSessionEstimate(
+      {
+        sessionId: '8e2ebaa4-6e1c',
+        bytes: 0,
+        estimatedTokens: 0,
+        totalBytes: 0,
+        hasCompactBoundary: false,
+        preCompactTokens: null,
+        exists: true,
+        sessionFile: '/some/path/8e2ebaa4.jsonl',
+        actualInputTokens: 30066,
+        model: 'gemma4:26b',
+      },
+      { limits: { 'gemma4:26b': 32768 } },
+    );
+    expect(text).toContain('30,066');
+    expect(text).toContain('32,768');
+    expect(text).toContain('92%');
+    expect(text).toContain('gemma4:26b');
+  });
+
+  it('formats actual usage without percent when the model limit is unknown', () => {
+    const text = formatSessionEstimate(
+      {
+        sessionId: 'abc12345',
+        bytes: 0,
+        estimatedTokens: 0,
+        totalBytes: 0,
+        hasCompactBoundary: false,
+        preCompactTokens: null,
+        exists: true,
+        sessionFile: '/p',
+        actualInputTokens: 5000,
+        model: 'mystery-model',
+      },
+      { limits: {} },
+    );
+    expect(text).toContain('5,000');
+    expect(text).not.toContain('%');
+  });
+
+  it('falls back to the byte estimate when no actual usage is available', () => {
     const text = formatSessionEstimate({
       sessionId: 'abc12345xyz',
       bytes: 320000,
@@ -328,26 +410,11 @@ describe('formatSessionEstimate', () => {
       preCompactTokens: null,
       exists: true,
       sessionFile: '/some/path/abc.jsonl',
+      actualInputTokens: null,
+      model: null,
     });
     expect(text).toContain('80,000');
     expect(text.toLowerCase()).toContain('no compaction yet');
-  });
-
-  it('formats a compacted session with effective vs transcript distinction', () => {
-    const text = formatSessionEstimate({
-      sessionId: '8e2ebaa4-6e1c',
-      bytes: 7432,
-      estimatedTokens: 1858,
-      totalBytes: 389364,
-      hasCompactBoundary: true,
-      preCompactTokens: 60506,
-      exists: true,
-      sessionFile: '/some/path/8e2ebaa4.jsonl',
-    });
-    expect(text).toContain('1,858');
-    expect(text.toLowerCase()).toContain('effective tokens');
-    expect(text).toContain('60,506');
-    expect(text).toContain('8e2ebaa4');
   });
 
   it('says "no active session" when absent', () => {
@@ -360,6 +427,8 @@ describe('formatSessionEstimate', () => {
       preCompactTokens: null,
       exists: false,
       sessionFile: '/some/path.jsonl',
+      actualInputTokens: null,
+      model: null,
     });
     expect(text.toLowerCase()).toContain('no active session');
   });

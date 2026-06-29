@@ -13,7 +13,11 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR } from './config.js';
+import {
+  DATA_DIR,
+  DEFAULT_CONTEXT_LIMIT,
+  MODEL_CONTEXT_LIMITS,
+} from './config.js';
 
 export interface SessionEstimate {
   sessionId: string;
@@ -31,6 +35,12 @@ export interface SessionEstimate {
   preCompactTokens: number | null;
   exists: boolean;
   sessionFile: string;
+  /** Exact context size the model reported on its most recent assistant turn
+   * (input_tokens + cache_read + cache_creation), or null if the transcript
+   * has no assistant usage yet. This is preferred over the bytes/4 estimate. */
+  actualInputTokens: number | null;
+  /** Model name from the most recent assistant turn, or null. */
+  model: string | null;
 }
 
 interface EstimateOptions {
@@ -45,6 +55,8 @@ interface CacheEntry {
   totalBytes: number;
   hasCompactBoundary: boolean;
   preCompactTokens: number | null;
+  actualInputTokens: number | null;
+  model: string | null;
   mtimeMs: number;
   at: number;
 }
@@ -61,12 +73,16 @@ function scanForLastBoundary(file: string): {
   hasBoundary: boolean;
   preCompactTokens: number | null;
   totalBytes: number;
+  actualInputTokens: number | null;
+  model: string | null;
 } {
   const buf = fs.readFileSync(file);
   const totalBytes = buf.length;
   let cursor = 0;
   let lastBoundaryEnd: number | null = null;
   let preCompactTokens: number | null = null;
+  let actualInputTokens: number | null = null;
+  let model: string | null = null;
 
   while (cursor < totalBytes) {
     const nl = buf.indexOf(0x0a, cursor); // '\n'
@@ -93,6 +109,34 @@ function scanForLastBoundary(file: string): {
           /* malformed line; skip */
         }
       }
+      // Capture the most recent assistant turn's reported usage + model. The
+      // model reports the exact context size per turn, which is far better than
+      // the bytes/4 estimate. Hint on '"usage"' to avoid parsing every line.
+      if (line.includes('"usage"')) {
+        try {
+          const obj = JSON.parse(line) as {
+            type?: string;
+            message?: {
+              model?: string;
+              usage?: {
+                input_tokens?: number;
+                cache_read_input_tokens?: number;
+                cache_creation_input_tokens?: number;
+              };
+            };
+          };
+          const usage = obj.type === 'assistant' ? obj.message?.usage : undefined;
+          if (usage && typeof usage.input_tokens === 'number') {
+            actualInputTokens =
+              usage.input_tokens +
+              (usage.cache_read_input_tokens ?? 0) +
+              (usage.cache_creation_input_tokens ?? 0);
+            model = obj.message?.model ?? model;
+          }
+        } catch {
+          /* malformed line; skip */
+        }
+      }
     }
     if (nl === -1) break;
     cursor = end;
@@ -104,6 +148,8 @@ function scanForLastBoundary(file: string): {
     hasBoundary: lastBoundaryEnd !== null,
     preCompactTokens,
     totalBytes,
+    actualInputTokens,
+    model,
   };
 }
 
@@ -199,6 +245,8 @@ export function estimateSessionTokens(
       preCompactTokens: null,
       exists: false,
       sessionFile: '',
+      actualInputTokens: null,
+      model: null,
     };
   }
 
@@ -232,6 +280,8 @@ export function estimateSessionTokens(
       preCompactTokens: cached.preCompactTokens,
       exists: cached.bytes > 0 || cached.totalBytes > 0,
       sessionFile: file,
+      actualInputTokens: cached.actualInputTokens,
+      model: cached.model,
     };
   }
 
@@ -241,6 +291,8 @@ export function estimateSessionTokens(
       totalBytes: 0,
       hasCompactBoundary: false,
       preCompactTokens: null,
+      actualInputTokens: null,
+      model: null,
       mtimeMs: 0,
       at: now,
     });
@@ -253,6 +305,8 @@ export function estimateSessionTokens(
       preCompactTokens: null,
       exists: false,
       sessionFile: file,
+      actualInputTokens: null,
+      model: null,
     };
   }
 
@@ -262,6 +316,8 @@ export function estimateSessionTokens(
     totalBytes: scan.totalBytes,
     hasCompactBoundary: scan.hasBoundary,
     preCompactTokens: scan.preCompactTokens,
+    actualInputTokens: scan.actualInputTokens,
+    model: scan.model,
     mtimeMs,
     at: now,
   });
@@ -275,16 +331,42 @@ export function estimateSessionTokens(
     preCompactTokens: scan.preCompactTokens,
     exists: true,
     sessionFile: file,
+    actualInputTokens: scan.actualInputTokens,
+    model: scan.model,
   };
 }
 
-export function formatSessionEstimate(e: SessionEstimate): string {
+export interface FormatOptions {
+  /** model → context-window size, for showing % of limit. */
+  limits?: Record<string, number>;
+  /** Fallback window size when the model isn't in `limits`. */
+  defaultLimit?: number;
+}
+
+export function formatSessionEstimate(
+  e: SessionEstimate,
+  opts: FormatOptions = {},
+): string {
   if (!e.exists) {
     return `No active session on disk (id ${e.sessionId}). Context: 0 tokens.`;
   }
+  const sessionShort = e.sessionId.slice(0, 8);
+
+  // Preferred path: the model reported an exact context size for its last turn.
+  if (e.actualInputTokens !== null) {
+    const tokens = e.actualInputTokens.toLocaleString();
+    const limit = (e.model && opts.limits?.[e.model]) || opts.defaultLimit || 0;
+    const parts = [`Session ${sessionShort}…: ${tokens} tokens`];
+    if (limit > 0) {
+      const pct = Math.round((e.actualInputTokens / limit) * 100);
+      parts[0] = `Session ${sessionShort}…: ${tokens} / ${limit.toLocaleString()} tokens (${pct}%)`;
+    }
+    if (e.model) parts.push(`· ${e.model}`);
+    return parts.join(' ');
+  }
+
   const tokens = e.estimatedTokens.toLocaleString();
   const kbActive = (e.bytes / 1024).toFixed(1);
-  const sessionShort = e.sessionId.slice(0, 8);
   if (e.hasCompactBoundary) {
     const totalKb = (e.totalBytes / 1024).toFixed(1);
     const pre = e.preCompactTokens
@@ -312,13 +394,16 @@ export function formatSessionEstimate(e: SessionEstimate): string {
 export function describeGroupContext(
   groupFolder: string,
   trackedSessionId: string | undefined,
-  opts: EstimateOptions = {},
+  opts: EstimateOptions & FormatOptions = {},
 ): string {
   const sessionId =
     trackedSessionId ?? findLatestSessionId(groupFolder, opts) ?? undefined;
   if (!sessionId) return 'No active session yet — context is empty.';
   const estimate = estimateSessionTokens(sessionId, groupFolder, opts);
-  return formatSessionEstimate(estimate);
+  return formatSessionEstimate(estimate, {
+    limits: opts.limits ?? MODEL_CONTEXT_LIMITS,
+    defaultLimit: opts.defaultLimit ?? DEFAULT_CONTEXT_LIMIT,
+  });
 }
 
 /** Clear in-memory cache. Useful for tests; also called after /compact. */
