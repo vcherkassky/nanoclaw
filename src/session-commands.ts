@@ -52,6 +52,8 @@ export interface SessionCommandDeps {
   canSenderInteract: (msg: NewMessage) => boolean;
   /** Returns a human-readable summary of current session context size. Used by /context. */
   describeContext?: () => string;
+  /** Returns a one-line compaction summary (tokens before/after). Used by /compact. */
+  describeCompaction?: () => string;
   /** Triggers an immediate status digest refresh. Used by /status. */
   refreshStatus?: () => Promise<void>;
 }
@@ -189,6 +191,10 @@ export async function handleSessionCommand(opts: {
 
   if (cmdOutput === 'error' || hadCmdError) {
     await deps.sendMessage(`${command} failed. The session is unchanged.`);
+  } else if (command === '/compact' && deps.describeCompaction) {
+    // /compact often returns no text (esp. on Ollama); surface the stats so the
+    // user can see how much was summarized.
+    await deps.sendMessage(deps.describeCompaction());
   }
 
   return { handled: true, success: true };

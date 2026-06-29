@@ -139,6 +139,40 @@ describe('handleSessionCommand', () => {
     expect(deps.advanceCursor).toHaveBeenCalledWith('100');
   });
 
+  it('sends compaction stats after a successful /compact', async () => {
+    const describeCompaction = vi.fn().mockReturnValue('Compacted: 30,000 → ~1,900 tokens (94% smaller).');
+    const deps = makeDeps({ describeCompaction });
+    await handleSessionCommand({
+      missedMessages: [makeMsg('/compact')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(describeCompaction).toHaveBeenCalledOnce();
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      'Compacted: 30,000 → ~1,900 tokens (94% smaller).',
+    );
+  });
+
+  it('does not send compaction stats when /compact errors', async () => {
+    const describeCompaction = vi.fn().mockReturnValue('stats');
+    const deps = makeDeps({
+      describeCompaction,
+      runAgent: vi.fn().mockResolvedValue('error'),
+    });
+    await handleSessionCommand({
+      missedMessages: [makeMsg('/compact')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(describeCompaction).not.toHaveBeenCalled();
+  });
+
   it('handles /status host-side via refreshStatus (no agent invoked, no chat reply)', async () => {
     const refreshStatus = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({ refreshStatus });

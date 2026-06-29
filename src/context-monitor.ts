@@ -412,6 +412,36 @@ export function describeGroupContext(
   });
 }
 
+/**
+ * Build a one-line compaction summary for after a `/compact` run: how many
+ * tokens were summarized and the resulting size. Right after compaction there
+ * is no post-boundary assistant turn yet, so the post size is the byte estimate
+ * of the injected summary (prefixed `~`); it becomes exact on the next message.
+ */
+export function describeCompaction(
+  groupFolder: string,
+  trackedSessionId: string | undefined,
+  opts: EstimateOptions = {},
+): string {
+  const sessionId =
+    trackedSessionId ?? findLatestSessionId(groupFolder, opts) ?? undefined;
+  if (!sessionId) return 'Compaction complete.';
+  const e = estimateSessionTokens(sessionId, groupFolder, opts);
+  if (!e.hasCompactBoundary || !e.preCompactTokens) {
+    return 'Compaction complete.';
+  }
+  const approx = e.actualInputTokens === null;
+  const post = e.actualInputTokens ?? e.estimatedTokens;
+  const pct =
+    e.preCompactTokens > 0
+      ? Math.max(0, Math.round((1 - post / e.preCompactTokens) * 100))
+      : 0;
+  const postStr = `${approx ? '~' : ''}${post.toLocaleString()}`;
+  let msg = `🗜️ Compacted: ${e.preCompactTokens.toLocaleString()} → ${postStr} tokens (${pct}% smaller).`;
+  if (approx) msg += ' Exact size updates after your next message.';
+  return msg;
+}
+
 /** Clear in-memory cache. Useful for tests; also called after /compact. */
 export function clearContextMonitorCache(): void {
   cache.clear();

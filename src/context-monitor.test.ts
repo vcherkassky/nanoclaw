@@ -5,6 +5,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  describeCompaction,
   describeGroupContext,
   estimateSessionTokens,
   findLatestSessionId,
@@ -411,6 +412,64 @@ describe('describeGroupContext', () => {
       ttlMs: 0,
     });
     expect(text.toLowerCase()).toContain('no active session yet');
+  });
+});
+
+describe('describeCompaction', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-monitor-compact-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function writeSession(folder: string, sessionId: string, body: string) {
+    const dir = path.join(
+      tmpDir,
+      'data',
+      'sessions',
+      folder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), body);
+  }
+
+  it('reports pre→post tokens and a reduction percent', () => {
+    const lines = [
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'm', usage: { input_tokens: 30000 } },
+      }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        compact_metadata: { preTokens: 30000 },
+      }),
+      JSON.stringify({ type: 'user', content: 'short summary' }),
+    ];
+    writeSession('g', 'sess1', lines.join('\n') + '\n');
+    const text = describeCompaction('g', 'sess1', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(text.toLowerCase()).toContain('compacted');
+    expect(text).toContain('30,000');
+    expect(text).toMatch(/\d+% smaller/);
+  });
+
+  it('falls back gracefully when no compaction boundary is present', () => {
+    writeSession('g', 'sess1', JSON.stringify({ type: 'user', content: 'x' }) + '\n');
+    const text = describeCompaction('g', 'sess1', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(text.toLowerCase()).toContain('compaction complete');
   });
 });
 

@@ -28,6 +28,7 @@ import { SystemProvider } from './status/providers/system.js';
 import { renderTelegramStatus } from './status/renderers/telegram.js';
 import { StatusScheduler } from './status/scheduler.js';
 import {
+  describeCompaction,
   describeGroupContext,
   estimateSessionTokens,
   findLatestSessionId,
@@ -252,6 +253,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
       describeContext: () =>
         describeGroupContext(group.folder, sessions[group.folder]),
+      describeCompaction: () =>
+        describeCompaction(group.folder, sessions[group.folder]),
       refreshStatus: refreshStatus ? () => refreshStatus!() : undefined,
     },
   });
