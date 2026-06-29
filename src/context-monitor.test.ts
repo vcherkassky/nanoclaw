@@ -151,7 +151,10 @@ describe('estimateSessionTokens', () => {
       JSON.stringify({ type: 'user', content: 'hi' }),
       JSON.stringify({
         type: 'assistant',
-        message: { model: 'gemma4:26b', usage: { input_tokens: 1000, output_tokens: 50 } },
+        message: {
+          model: 'gemma4:26b',
+          usage: { input_tokens: 1000, output_tokens: 50 },
+        },
       }),
       JSON.stringify({
         type: 'assistant',
@@ -176,8 +179,62 @@ describe('estimateSessionTokens', () => {
     expect(r.model).toBe('gemma4:26b');
   });
 
+  it('discards pre-compaction usage when a compact_boundary follows the last assistant turn', () => {
+    // Mirrors a just-ran /compact: an assistant turn, then a boundary, then
+    // only the injected summary (user entries) — no new assistant turn yet.
+    const lines = [
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'gemma4:26b', usage: { input_tokens: 30000 } },
+      }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        compact_metadata: { preTokens: 30000 },
+      }),
+      JSON.stringify({ type: 'user', content: 'summary line' }),
+    ];
+    makeSessionFile('g', 'sess1', lines.join('\n') + '\n');
+    const r = estimateSessionTokens('sess1', 'g', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    // The 30k usage is pre-compaction → stale → fall back to byte estimate.
+    expect(r.actualInputTokens).toBeNull();
+    expect(r.hasCompactBoundary).toBe(true);
+  });
+
+  it('uses post-compaction assistant usage when a turn follows the boundary', () => {
+    const lines = [
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'gemma4:26b', usage: { input_tokens: 30000 } },
+      }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        compact_metadata: { preTokens: 30000 },
+      }),
+      JSON.stringify({ type: 'user', content: 'summary' }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'gemma4:26b', usage: { input_tokens: 4200 } },
+      }),
+    ];
+    makeSessionFile('g', 'sess1', lines.join('\n') + '\n');
+    const r = estimateSessionTokens('sess1', 'g', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(r.actualInputTokens).toBe(4200);
+  });
+
   it('reports null actual tokens when no assistant usage is present', () => {
-    makeSessionFile('g', 'sess1', JSON.stringify({ type: 'user', content: 'x' }) + '\n');
+    makeSessionFile(
+      'g',
+      'sess1',
+      JSON.stringify({ type: 'user', content: 'x' }) + '\n',
+    );
     const r = estimateSessionTokens('sess1', 'g', {
       dataDir: path.join(tmpDir, 'data'),
       ttlMs: 0,

@@ -104,6 +104,11 @@ function scanForLastBoundary(file: string): {
               obj.compact_metadata?.preTokens ??
               obj.compactMetadata?.preTokens ??
               null;
+            // Any assistant usage seen so far is pre-compaction and no longer
+            // reflects the current context. Discard it; a post-boundary
+            // assistant turn (if any) will set it again below.
+            actualInputTokens = null;
+            model = null;
           }
         } catch {
           /* malformed line; skip */
@@ -125,7 +130,8 @@ function scanForLastBoundary(file: string): {
               };
             };
           };
-          const usage = obj.type === 'assistant' ? obj.message?.usage : undefined;
+          const usage =
+            obj.type === 'assistant' ? obj.message?.usage : undefined;
           if (usage && typeof usage.input_tokens === 'number') {
             actualInputTokens =
               usage.input_tokens +
