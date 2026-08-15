@@ -3,7 +3,43 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock registry (registerChannel runs at import time)
 vi.mock('./registry.js', () => ({ registerChannel: vi.fn() }));
 
+// Mock db so attempt-tracking helpers don't touch SQLite
+vi.mock('../db.js', () => ({
+  clearEmailAttempt: vi.fn(),
+  getEmailAttempt: vi.fn(() => null),
+  recordEmailAttempt: vi.fn(),
+  setRouterState: vi.fn(),
+}));
+
 import { GmailChannel, GmailChannelOpts } from './gmail.js';
+
+interface ModifyCall {
+  userId: string;
+  id: string;
+  requestBody: { addLabelIds?: string[]; removeLabelIds?: string[] };
+}
+
+function withMockGmail(channel: GmailChannel): {
+  modify: ReturnType<typeof vi.fn>;
+} {
+  const modify = vi.fn(async () => ({}));
+  (channel as unknown as { gmail: unknown }).gmail = {
+    users: { messages: { modify } },
+  };
+  return { modify };
+}
+
+function trackProcessing(
+  channel: GmailChannel,
+  messageId: string,
+  quarantined: boolean,
+): Promise<void> {
+  return (
+    channel as unknown as {
+      trackProcessing: (id: string, q: boolean) => Promise<void>;
+    }
+  ).trackProcessing(messageId, quarantined);
+}
 
 function makeOpts(overrides?: Partial<GmailChannelOpts>): GmailChannelOpts {
   return {
@@ -51,6 +87,30 @@ describe('GmailChannel', () => {
     it('sets connected to false', async () => {
       await channel.disconnect();
       expect(channel.isConnected()).toBe(false);
+    });
+  });
+
+  describe('trackProcessing (PA channel, no labelTracking)', () => {
+    it('marks a quarantined email as read so it is not re-fetched every poll', async () => {
+      const ch = new GmailChannel(makeOpts({ labelTracking: false }));
+      const { modify } = withMockGmail(ch);
+
+      await trackProcessing(ch, 'msg-quarantined', true);
+
+      expect(modify).toHaveBeenCalledTimes(1);
+      const arg = modify.mock.calls[0][0] as ModifyCall;
+      expect(arg.id).toBe('msg-quarantined');
+      expect(arg.requestBody.removeLabelIds).toEqual(['UNREAD']);
+    });
+
+    it('marks a safe email as read', async () => {
+      const ch = new GmailChannel(makeOpts({ labelTracking: false }));
+      const { modify } = withMockGmail(ch);
+
+      await trackProcessing(ch, 'msg-safe', false);
+
+      const arg = modify.mock.calls[0][0] as ModifyCall;
+      expect(arg.requestBody.removeLabelIds).toEqual(['UNREAD']);
     });
   });
 

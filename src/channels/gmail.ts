@@ -710,6 +710,30 @@ export class GmailChannel implements Channel {
     }
 
     // Track processing: label (monitor channel) or mark-as-read (PA channel)
+    await this.trackProcessing(messageId, quarantined);
+
+    if (!quarantined) {
+      logger.info(
+        { mainJid, from: senderName, subject },
+        'Gmail email delivered to main group',
+      );
+    }
+  }
+
+  /**
+   * Mark an email as handled so it isn't re-fetched on the next poll.
+   *
+   * Monitor channel (labelTracking): apply the processed/quarantine label.
+   * PA channel: mark as read — including quarantined mail. Otherwise a
+   * quarantined email stays unread and is re-fetched and re-classified on
+   * every poll, looping forever and burning the GPU each time.
+   */
+  private async trackProcessing(
+    messageId: string,
+    quarantined: boolean,
+  ): Promise<void> {
+    if (!this.gmail) return;
+
     if (this.opts.labelTracking) {
       const labelId = quarantined
         ? this.quarantinedLabelId
@@ -734,8 +758,7 @@ export class GmailChannel implements Channel {
       } else {
         clearEmailAttempt(messageId);
       }
-    } else if (!quarantined) {
-      // PA channel: mark as read (quarantined emails don't reach here without labelTracking)
+    } else {
       try {
         await this.gmail.users.messages.modify({
           userId: 'me',
@@ -746,13 +769,6 @@ export class GmailChannel implements Channel {
       } catch (err) {
         logger.warn({ messageId, err }, 'Failed to mark email as read');
       }
-    }
-
-    if (!quarantined) {
-      logger.info(
-        { mainJid, from: senderName, subject },
-        'Gmail email delivered to main group',
-      );
     }
   }
 
