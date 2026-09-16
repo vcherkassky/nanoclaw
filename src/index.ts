@@ -90,6 +90,7 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { isOllamaReachable } from './ollama-health.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -521,6 +522,17 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
       'processEmailHeadless: PUBLIC_INBOX_TARGET_JID not set, skipping',
     );
     return;
+  }
+
+  // Pre-flight: if the local model backend is unreachable (e.g. the laptop is
+  // asleep / lid closed), don't spawn a container — it would just hang for the
+  // full timeout producing no output (code 137). Throw so the caller defers the
+  // email for retry on a later poll rather than marking it processed.
+  if (!(await isOllamaReachable())) {
+    logger.warn(
+      'processEmailHeadless: model backend unreachable — deferring email for retry',
+    );
+    throw new Error('Model backend unreachable; deferring email for retry');
   }
 
   const emailProcessorGroup: RegisteredGroup = {
