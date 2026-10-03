@@ -10,10 +10,18 @@
  * Read-only / non-loading endpoints (/api/tags, /api/ps, /api/show,
  * /api/version) bypass the lock entirely. Streaming is preserved by piping
  * the upstream response body directly to the client.
+ *
+ * GET /metrics serves OpenTelemetry metrics in Prometheus format
+ * (see ollama-metrics.ts).
  */
 import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 
 import { logger } from './logger.js';
+import {
+  extractInferenceStats,
+  OllamaMetrics,
+  StreamStatsTail,
+} from './ollama-metrics.js';
 
 export interface ProxyRequest {
   method: string;
@@ -29,6 +37,12 @@ export interface ProxyResponse {
 export interface OllamaProxyOptions {
   realHost: string;
   fetchFn?: typeof fetch;
+}
+
+const METRICS_PATH = '/metrics';
+
+function secondsSince(start: number): number {
+  return (performance.now() - start) / 1000;
 }
 
 const MODEL_LOADING_PATHS = new Set([
@@ -63,10 +77,14 @@ export class OllamaProxy {
   private lastEvictionAt: string | null = null;
   private mutex = new AsyncMutex();
   private server: Server | null = null;
+  readonly metrics: OllamaMetrics;
 
   constructor(opts: OllamaProxyOptions) {
     this.realHost = opts.realHost.replace(/\/$/, '');
     this.fetchFn = opts.fetchFn ?? fetch;
+    this.metrics = new OllamaMetrics({
+      getCurrentModel: () => this.currentModel,
+    });
   }
 
   getCurrentModel(): string | null {
@@ -114,6 +132,20 @@ export class OllamaProxy {
 
   async handle(req: ProxyRequest): Promise<ProxyResponse> {
     this.requestCount++;
+    const start = performance.now();
+    const model = req.body?.model as string | undefined;
+    const response = await this.handleInner(req, start);
+    this.metrics.recordRequest(
+      { path: req.path, model, status: response.status },
+      secondsSince(start),
+    );
+    return response;
+  }
+
+  private async handleInner(
+    req: ProxyRequest,
+    start: number,
+  ): Promise<ProxyResponse> {
     if (!MODEL_LOADING_PATHS.has(req.path)) {
       return this.forward(req);
     }
@@ -124,11 +156,14 @@ export class OllamaProxy {
     }
 
     return this.mutex.runExclusive(async () => {
+      this.metrics.recordLockWait(requested, secondsSince(start));
       if (this.currentModel && this.currentModel !== requested) {
-        await this.evict(this.currentModel);
+        await this.evict(this.currentModel, requested);
       }
 
       const response = await this.forward(req);
+      const stats = extractInferenceStats(response.body);
+      if (stats) this.metrics.recordInference(requested, stats);
 
       // Update state based on outcome
       if (response.status === 502) {
@@ -147,8 +182,9 @@ export class OllamaProxy {
     });
   }
 
-  private async evict(model: string): Promise<void> {
+  private async evict(model: string, nextModel: string): Promise<void> {
     this.evictionCount++;
+    this.metrics.recordEviction(model, nextModel);
     this.lastEvictionAt = new Date().toISOString();
     logger.info({ model }, 'OllamaProxy: evicting model before swap');
     try {
@@ -185,6 +221,7 @@ export class OllamaProxy {
         },
         'OllamaProxy: upstream fetch failed',
       );
+      this.metrics.recordUpstreamError(req.path);
       return { status: 502, body: { error: 'upstream unreachable' } };
     }
   }
@@ -232,6 +269,11 @@ export class OllamaProxy {
     const method = req.method ?? 'GET';
     const path = (req.url ?? '/').split('?')[0];
 
+    if ((method === 'GET' || method === 'HEAD') && path === METRICS_PATH) {
+      this.metrics.handleScrape(req, res);
+      return;
+    }
+
     // For model-loading paths we need to peek at the JSON body to read the
     // model field. For passthrough paths we could stream-forward, but
     // buffering is fine — Ollama request bodies are small.
@@ -251,8 +293,10 @@ export class OllamaProxy {
       // For model-loading paths we stream upstream straight back so SSE
       // (stream: true) flows token-by-token. We still acquire the lock
       // around model swap.
+      this.requestCount++;
+      const start = performance.now();
+      const requested = body?.model as string | undefined;
       await this.mutex.runExclusive(async () => {
-        const requested = body?.model as string | undefined;
         if (!requested) {
           res.statusCode = 400;
           res.setHeader('Content-Type', 'application/json');
@@ -260,8 +304,9 @@ export class OllamaProxy {
           return;
         }
 
+        this.metrics.recordLockWait(requested, secondsSince(start));
         if (this.currentModel && this.currentModel !== requested) {
-          await this.evict(this.currentModel);
+          await this.evict(this.currentModel, requested);
         }
 
         try {
@@ -286,15 +331,21 @@ export class OllamaProxy {
 
           if (upstream.body) {
             const reader = upstream.body.getReader();
+            const tail = new StreamStatsTail();
             try {
               for (;;) {
                 const { value, done } = await reader.read();
                 if (done) break;
-                if (value) res.write(Buffer.from(value));
+                if (value) {
+                  res.write(Buffer.from(value));
+                  tail.push(value);
+                }
               }
             } finally {
               reader.releaseLock();
             }
+            const stats = tail.finish();
+            if (stats) this.metrics.recordInference(requested, stats);
           }
           res.end();
 
@@ -313,6 +364,7 @@ export class OllamaProxy {
             },
             'OllamaProxy: streaming forward failed',
           );
+          this.metrics.recordUpstreamError(path);
           if (!res.headersSent) {
             res.statusCode = 502;
             res.setHeader('Content-Type', 'application/json');
@@ -323,6 +375,10 @@ export class OllamaProxy {
           this.currentModel = null;
         }
       });
+      this.metrics.recordRequest(
+        { path, model: requested, status: res.statusCode },
+        secondsSince(start),
+      );
       return;
     }
 

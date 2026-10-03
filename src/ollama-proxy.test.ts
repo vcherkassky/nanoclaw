@@ -471,6 +471,125 @@ describe('OllamaProxy', () => {
       expect(json).toEqual({ models: [{ name: 'gemma4:e4b' }] });
       expect(proxyInstance.getCurrentModel()).toBeNull();
     });
+
+    it('serves Prometheus metrics on GET /metrics without hitting upstream', async () => {
+      await fetch(`${proxyUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'X', messages: [] }),
+      });
+      upstreamCalls = [];
+
+      const res = await fetch(`${proxyUrl}/metrics`);
+      const text = await res.text();
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toMatch(/text\/plain/);
+      expect(text).toMatch(
+        /ollama_proxy_requests_total\{[^}]*path="\/api\/chat"[^}]*\} 1/,
+      );
+      expect(text).toMatch(/ollama_proxy_loaded_model\{model="X"\} 1/);
+      expect(upstreamCalls).toHaveLength(0);
+      // Scrapes are not counted as proxied requests
+      expect(text).not.toMatch(/path="\/metrics"/);
+    });
+
+    it('answers HEAD /metrics locally instead of forwarding it', async () => {
+      const res = await fetch(`${proxyUrl}/metrics`, { method: 'HEAD' });
+      expect(res.status).toBe(200);
+      expect(upstreamCalls).toHaveLength(0);
+    });
+
+    it('records streamed token stats and counts the streamed request', async () => {
+      upstreamReply = (_req, res) => {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        res.write(
+          JSON.stringify({ done: false, message: { content: 'a' } }) + '\n',
+        );
+        res.write('{"done":true,"prompt_eval_count":11,');
+        res.end('"eval_count":22,"eval_duration":2000000000}\n');
+      };
+
+      const res = await fetch(`${proxyUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'S', messages: [], stream: true }),
+      });
+      await res.text();
+
+      const text = await proxyInstance.metrics.scrape();
+      expect(text).toMatch(
+        /gen_ai_client_token_usage_sum\{[^}]*gen_ai_request_model="S"[^}]*gen_ai_token_type="output"[^}]*\} 22/,
+      );
+      expect(text).toMatch(/ollama_eval_tokens_per_second_sum\{[^}]*\} 11/);
+      // The request is recorded after res.end(), so the client can win the race
+      await vi.waitFor(async () =>
+        expect(await proxyInstance.metrics.scrape()).toMatch(
+          /ollama_proxy_requests_total\{path="\/api\/chat",status="200",model="S"\} 1/,
+        ),
+      );
+      expect(proxyInstance.getStats().requests).toBe(1);
+    });
+  });
+
+  describe('metrics', () => {
+    it('records request, token usage and load time for a chat request', async () => {
+      fetchMock.mockResolvedValueOnce(
+        jsonResponse(200, {
+          done: true,
+          prompt_eval_count: 30,
+          eval_count: 12,
+          load_duration: 4_000_000_000,
+        }),
+      );
+      await proxy.handle({
+        method: 'POST',
+        path: '/api/chat',
+        body: { model: 'M', messages: [] },
+      });
+
+      const text = await proxy.metrics.scrape();
+      expect(text).toMatch(
+        /ollama_proxy_requests_total\{[^}]*model="M"[^}]*\} 1/,
+      );
+      expect(text).toMatch(
+        /gen_ai_client_token_usage_sum\{[^}]*gen_ai_token_type="input"[^}]*\} 30/,
+      );
+      expect(text).toMatch(/ollama_load_duration_sum\{[^}]*\} 4/);
+      expect(text).toContain('ollama_proxy_lock_wait_duration_count');
+    });
+
+    it('counts evictions with from/to models', async () => {
+      fetchMock.mockResolvedValue(jsonResponse(200, {}));
+      await proxy.handle({
+        method: 'POST',
+        path: '/api/chat',
+        body: { model: 'A' },
+      });
+      await proxy.handle({
+        method: 'POST',
+        path: '/api/chat',
+        body: { model: 'B' },
+      });
+
+      expect(await proxy.metrics.scrape()).toMatch(
+        /ollama_proxy_evictions_total\{from_model="A",to_model="B"\} 1/,
+      );
+    });
+
+    it('counts upstream errors', async () => {
+      fetchMock.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      await proxy.handle({ method: 'GET', path: '/api/tags' });
+
+      const text = await proxy.metrics.scrape();
+      expect(text).toMatch(
+        /ollama_proxy_upstream_errors_total\{path="\/api\/tags"\} 1/,
+      );
+      expect(text).toMatch(
+        /ollama_proxy_requests_total\{[^}]*status="502"[^}]*\} 1/,
+      );
+    });
   });
 
   describe('endpoint routing', () => {
