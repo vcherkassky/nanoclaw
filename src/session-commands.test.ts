@@ -140,7 +140,9 @@ describe('handleSessionCommand', () => {
   });
 
   it('sends compaction stats after a successful /compact', async () => {
-    const describeCompaction = vi.fn().mockReturnValue('Compacted: 30,000 → ~1,900 tokens (94% smaller).');
+    const describeCompaction = vi
+      .fn()
+      .mockReturnValue('Compacted: 30,000 → ~1,900 tokens (94% smaller).');
     const deps = makeDeps({ describeCompaction });
     await handleSessionCommand({
       missedMessages: [makeMsg('/compact')],

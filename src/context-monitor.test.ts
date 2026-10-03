@@ -464,7 +464,11 @@ describe('describeCompaction', () => {
   });
 
   it('falls back gracefully when no compaction boundary is present', () => {
-    writeSession('g', 'sess1', JSON.stringify({ type: 'user', content: 'x' }) + '\n');
+    writeSession(
+      'g',
+      'sess1',
+      JSON.stringify({ type: 'user', content: 'x' }) + '\n',
+    );
     const text = describeCompaction('g', 'sess1', {
       dataDir: path.join(tmpDir, 'data'),
       ttlMs: 0,

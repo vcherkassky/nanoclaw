@@ -18,8 +18,8 @@ describe('parseModelContextLimits', () => {
   });
 
   it('ignores malformed entries and keeps valid ones', () => {
-    expect(parseModelContextLimits('good=100,bad,=5,x=notnum, spaced = 200 ')).toEqual(
-      { good: 100, spaced: 200 },
-    );
+    expect(
+      parseModelContextLimits('good=100,bad,=5,x=notnum, spaced = 200 '),
+    ).toEqual({ good: 100, spaced: 200 });
   });
 });
