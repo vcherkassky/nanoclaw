@@ -35,6 +35,28 @@ describe('extractInferenceStats', () => {
     ).toEqual({ inputTokens: 10, outputTokens: 5 });
   });
 
+  it('reads Anthropic usage, counting cached input tokens as input', () => {
+    expect(
+      extractInferenceStats({
+        type: 'message',
+        usage: {
+          input_tokens: 5,
+          cache_read_input_tokens: 12,
+          output_tokens: 16,
+        },
+      }),
+    ).toEqual({ inputTokens: 17, outputTokens: 16 });
+  });
+
+  it('reads Anthropic usage nested in a message_start event', () => {
+    expect(
+      extractInferenceStats({
+        type: 'message_start',
+        message: { usage: { input_tokens: 9, output_tokens: 0 } },
+      }),
+    ).toEqual({ inputTokens: 9, outputTokens: 0 });
+  });
+
   it('returns null when no stats are present', () => {
     expect(extractInferenceStats({ done: false, message: {} })).toBeNull();
     expect(extractInferenceStats(null)).toBeNull();
@@ -70,6 +92,27 @@ describe('StreamStatsTail', () => {
       ),
     );
     expect(tail.finish()).toEqual({ inputTokens: 4, outputTokens: 6 });
+  });
+
+  it('merges Anthropic SSE events, later events winning per field', () => {
+    const tail = new StreamStatsTail();
+    tail.push(
+      enc.encode(
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":20,"output_tokens":1}}}\n\n',
+      ),
+    );
+    tail.push(
+      enc.encode(
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"text":"hi"}}\n\n',
+      ),
+    );
+    // Real Anthropic message_delta carries only output_tokens
+    tail.push(
+      enc.encode(
+        'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":16}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ),
+    );
+    expect(tail.finish()).toEqual({ inputTokens: 20, outputTokens: 16 });
   });
 
   it('returns null when the stream carries no stats', () => {

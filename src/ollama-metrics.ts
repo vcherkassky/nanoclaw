@@ -61,6 +61,7 @@ const KNOWN_PATHS = new Set([
   '/v1/completions',
   '/v1/embeddings',
   '/v1/models',
+  '/v1/messages',
 ]);
 
 export function pathLabel(path: string): string {
@@ -73,18 +74,35 @@ function num(v: unknown): number | undefined {
 
 /**
  * Pull token counts and timings out of an Ollama response object. Handles
- * native /api/* responses (durations in ns) and OpenAI-compatible /v1/*
- * responses (`usage` block, no timings). Returns null if nothing is present.
+ * native /api/* responses (durations in ns), OpenAI-compatible /v1/*
+ * responses and Anthropic-compatible /v1/messages responses (`usage` block,
+ * no timings). Returns null if nothing is present.
  */
 export function extractInferenceStats(obj: unknown): InferenceStats | null {
   if (!obj || typeof obj !== 'object') return null;
   const o = obj as Record<string, unknown>;
   const stats: InferenceStats = {};
 
-  const usage = o.usage as Record<string, unknown> | undefined;
+  // Anthropic message_start nests usage under `message`
+  const message = o.message as Record<string, unknown> | undefined;
+  const usage = (o.usage ?? message?.usage) as
+    | Record<string, unknown>
+    | undefined;
   if (usage && typeof usage === 'object') {
-    stats.inputTokens = num(usage.prompt_tokens);
-    stats.outputTokens = num(usage.completion_tokens);
+    if ('input_tokens' in usage || 'output_tokens' in usage) {
+      // Anthropic: input_tokens excludes cache reads/writes; count them all
+      const input = num(usage.input_tokens);
+      stats.inputTokens =
+        input === undefined
+          ? undefined
+          : input +
+            (num(usage.cache_read_input_tokens) ?? 0) +
+            (num(usage.cache_creation_input_tokens) ?? 0);
+      stats.outputTokens = num(usage.output_tokens);
+    } else {
+      stats.inputTokens = num(usage.prompt_tokens);
+      stats.outputTokens = num(usage.completion_tokens);
+    }
   } else {
     stats.inputTokens = num(o.prompt_eval_count);
     stats.outputTokens = num(o.eval_count);
@@ -104,8 +122,10 @@ export function extractInferenceStats(obj: unknown): InferenceStats | null {
 }
 
 /**
- * Watches a streamed NDJSON or SSE body for the line carrying final stats,
- * without buffering the whole stream. Only lines that mention a stats field
+ * Watches a streamed NDJSON or SSE body for the lines carrying stats,
+ * without buffering the whole stream. Fields are merged across lines with
+ * later values winning, since Anthropic streams split usage between
+ * message_start (input) and message_delta (output). Only lines that mention a stats field
  * are JSON-parsed, so per-token chunks cost a substring check.
  */
 export class StreamStatsTail {
@@ -133,7 +153,7 @@ export class StreamStatsTail {
     if (!line.includes('eval_count') && !line.includes('"usage"')) return;
     try {
       const stats = extractInferenceStats(JSON.parse(line));
-      if (stats) this.last = stats;
+      if (stats) this.last = { ...this.last, ...stats };
     } catch {
       // Not JSON (or truncated) — ignore
     }

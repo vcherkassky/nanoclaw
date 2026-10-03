@@ -52,6 +52,7 @@ const MODEL_LOADING_PATHS = new Set([
   '/v1/chat/completions',
   '/v1/completions',
   '/v1/embeddings',
+  '/v1/messages',
 ]);
 
 class AsyncMutex {
@@ -296,7 +297,17 @@ export class OllamaProxy {
       this.requestCount++;
       const start = performance.now();
       const requested = body?.model as string | undefined;
+
+      // If the client goes away (e.g. a killed container), cancel the
+      // upstream generation so it doesn't keep holding the lock.
+      const upstreamAbort = new AbortController();
+      const onClientClose = () => {
+        if (!res.writableFinished) upstreamAbort.abort();
+      };
+      res.on('close', onClientClose);
+
       await this.mutex.runExclusive(async () => {
+        if (upstreamAbort.signal.aborted) return; // gave up while queued
         if (!requested) {
           res.statusCode = 400;
           res.setHeader('Content-Type', 'application/json');
@@ -314,6 +325,7 @@ export class OllamaProxy {
             method,
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
+            signal: upstreamAbort.signal,
           });
 
           res.statusCode = upstream.status;
@@ -357,6 +369,16 @@ export class OllamaProxy {
             this.currentModel = null;
           }
         } catch (err) {
+          if (upstreamAbort.signal.aborted) {
+            // Client disconnected: not an upstream failure, and the model
+            // stays loaded.
+            logger.info(
+              { path, model: requested },
+              'OllamaProxy: client disconnected, upstream request cancelled',
+            );
+            this.currentModel = requested;
+            return;
+          }
           logger.warn(
             {
               path,
@@ -375,8 +397,14 @@ export class OllamaProxy {
           this.currentModel = null;
         }
       });
+      res.off('close', onClientClose);
       this.metrics.recordRequest(
-        { path, model: requested, status: res.statusCode },
+        {
+          path,
+          model: requested,
+          // 499 = client closed request (nginx convention)
+          status: upstreamAbort.signal.aborted ? 499 : res.statusCode,
+        },
         secondsSince(start),
       );
       return;

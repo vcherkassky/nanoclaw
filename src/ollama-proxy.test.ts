@@ -494,6 +494,98 @@ describe('OllamaProxy', () => {
       expect(text).not.toMatch(/path="\/metrics"/);
     });
 
+    it('streams /v1/messages SSE through and records Anthropic token usage', async () => {
+      const events = [
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hey"}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","usage":{"input_tokens":5,"cache_read_input_tokens":12,"output_tokens":16}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ];
+      upstreamReply = (_req, res) => {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/event-stream');
+        for (const e of events) res.write(e);
+        res.end();
+      };
+
+      const res = await fetch(`${proxyUrl}/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'G', max_tokens: 16, stream: true }),
+      });
+      const text = await res.text();
+
+      expect(res.headers.get('content-type')).toBe('text/event-stream');
+      expect(text).toBe(events.join(''));
+      expect(proxyInstance.getCurrentModel()).toBe('G');
+      const scraped = await proxyInstance.metrics.scrape();
+      expect(scraped).toMatch(
+        /gen_ai_client_token_usage_sum\{[^}]*gen_ai_token_type="input"[^}]*\} 17/,
+      );
+      expect(scraped).toMatch(
+        /gen_ai_client_token_usage_sum\{[^}]*gen_ai_token_type="output"[^}]*\} 16/,
+      );
+      await vi.waitFor(async () =>
+        expect(await proxyInstance.metrics.scrape()).toMatch(
+          /ollama_proxy_requests_total\{path="\/v1\/messages",status="200",model="G"\} 1/,
+        ),
+      );
+    });
+
+    it('cancels the upstream request and releases the lock when the client disconnects', async () => {
+      let upstreamClosed = false;
+      upstreamReply = (req, res) => {
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/x-ndjson');
+        const timer = setInterval(
+          () => res.write(JSON.stringify({ done: false }) + '\n'),
+          20,
+        );
+        res.on('close', () => {
+          upstreamClosed = true;
+          clearInterval(timer);
+        });
+        // Would run for 10s if never cancelled
+        setTimeout(() => res.end(), 10_000);
+      };
+
+      const ac = new AbortController();
+      const res = await fetch(`${proxyUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'X', messages: [] }),
+        signal: ac.signal,
+      });
+      const reader = res.body!.getReader();
+      await reader.read();
+      ac.abort();
+
+      await vi.waitFor(() => expect(upstreamClosed).toBe(true));
+
+      // The lock is free again: a follow-up request completes promptly
+      upstreamReply = (_req, r) => {
+        r.statusCode = 200;
+        r.setHeader('Content-Type', 'application/json');
+        r.end(JSON.stringify({ ok: true }));
+      };
+      const t0 = performance.now();
+      const next = await fetch(`${proxyUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'X', messages: [] }),
+      });
+      expect(next.status).toBe(200);
+      expect(performance.now() - t0).toBeLessThan(1000);
+
+      // Client aborts are not upstream errors and keep the model loaded
+      const text = await proxyInstance.metrics.scrape();
+      expect(text).not.toContain('ollama_proxy_upstream_errors_total{');
+      expect(text).toMatch(
+        /ollama_proxy_requests_total\{path="\/api\/chat",status="499",model="X"\} 1/,
+      );
+      expect(proxyInstance.getCurrentModel()).toBe('X');
+    });
+
     it('answers HEAD /metrics locally instead of forwarding it', async () => {
       const res = await fetch(`${proxyUrl}/metrics`, { method: 'HEAD' });
       expect(res.status).toBe(200);
@@ -600,6 +692,7 @@ describe('OllamaProxy', () => {
       ['/v1/chat/completions'],
       ['/v1/completions'],
       ['/v1/embeddings'],
+      ['/v1/messages'],
     ])('%s acquires the lock and updates currentModel', async (path) => {
       fetchMock.mockResolvedValueOnce(jsonResponse(200, {}));
       await proxy.handle({
