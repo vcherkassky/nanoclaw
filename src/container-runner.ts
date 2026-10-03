@@ -275,6 +275,19 @@ function buildContainerArgs(
   ]);
   if (ANTHROPIC_MODEL) {
     args.push('-e', `ANTHROPIC_MODEL=${ANTHROPIC_MODEL}`);
+    // Claude Code also requests its small/fast model and haiku/sonnet/opus
+    // aliases (background tasks, subagents). Pin them all to the configured
+    // model so a local backend never sees a claude-* name, which would
+    // make the Ollama proxy evict the loaded model.
+    for (const v of [
+      'ANTHROPIC_SMALL_FAST_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'CLAUDE_CODE_SUBAGENT_MODEL',
+    ]) {
+      args.push('-e', `${v}=${ANTHROPIC_MODEL}`);
+    }
   }
   if (NANOCLAW_CONTEXT_DUMP) {
     args.push('-e', `NANOCLAW_CONTEXT_DUMP=${NANOCLAW_CONTEXT_DUMP}`);

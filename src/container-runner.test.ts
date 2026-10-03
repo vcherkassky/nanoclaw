@@ -91,6 +91,16 @@ function createFakeProcess() {
 
 let fakeProc: ReturnType<typeof createFakeProcess>;
 
+// Mock .env reads so tests control which model is configured
+const mockEnv: Record<string, string> = {};
+vi.mock('./env.js', () => ({
+  readEnvFile: vi.fn((keys: string[]) =>
+    Object.fromEntries(
+      keys.filter((k) => k in mockEnv).map((k) => [k, mockEnv[k]]),
+    ),
+  ),
+}));
+
 // Mock child_process.spawn
 vi.mock('child_process', async () => {
   const actual =
@@ -106,6 +116,8 @@ vi.mock('child_process', async () => {
     ),
   };
 });
+
+import { spawn } from 'child_process';
 
 import { runContainerAgent, ContainerOutput } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
@@ -227,5 +239,55 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+describe('container-runner model env', () => {
+  const ALIAS_VARS = [
+    'ANTHROPIC_SMALL_FAST_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'CLAUDE_CODE_SUBAGENT_MODEL',
+  ];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    vi.mocked(spawn).mockClear();
+  });
+
+  afterEach(() => {
+    for (const k of Object.keys(mockEnv)) delete mockEnv[k];
+    vi.useRealTimers();
+  });
+
+  async function spawnedEnv(): Promise<string[]> {
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      vi.fn(async () => {}),
+    );
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await resultPromise;
+    const args = vi.mocked(spawn).mock.calls[0][1] as string[];
+    return args.filter((_, i) => args[i - 1] === '-e');
+  }
+
+  it('pins every Claude Code model alias to ANTHROPIC_MODEL', async () => {
+    mockEnv.ANTHROPIC_MODEL = 'gemma4:26b';
+    const env = await spawnedEnv();
+    expect(env).toContain('ANTHROPIC_MODEL=gemma4:26b');
+    for (const v of ALIAS_VARS) expect(env).toContain(`${v}=gemma4:26b`);
+  });
+
+  it('leaves aliases at Claude defaults when ANTHROPIC_MODEL is unset', async () => {
+    const env = await spawnedEnv();
+    for (const v of ['ANTHROPIC_MODEL', ...ALIAS_VARS]) {
+      expect(env.some((e) => e.startsWith(`${v}=`))).toBe(false);
+    }
   });
 });
