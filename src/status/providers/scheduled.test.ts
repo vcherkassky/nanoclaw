@@ -49,6 +49,31 @@ describe('ScheduledTasksProvider', () => {
     expect(byLabel['Last success']).toMatch(/ago$/);
   });
 
+  it('shows next-run times in the given timezone', async () => {
+    createTask({
+      id: 'digest',
+      group_folder: 'main',
+      chat_jid: 'tg:1',
+      prompt: 'digest',
+      schedule_type: 'cron',
+      schedule_value: '0 8 * * *',
+      context_mode: 'isolated',
+      // 07:00 UTC = 08:00 Irish Summer Time
+      next_run: '2026-10-05T07:00:00.000Z',
+      status: 'active',
+      created_at: '2026-10-04T00:00:00.000Z',
+    });
+
+    const result = await new ScheduledTasksProvider({
+      now: () => new Date('2026-10-04T12:00:00.000Z').getTime(),
+      timezone: 'Europe/Dublin',
+    }).collect();
+    const byLabel = Object.fromEntries(
+      result.rows.map((r) => [r.label, r.value]),
+    );
+    expect(byLabel['Next runs']).toBe('digest 08:00');
+  });
+
   it('handles empty schedule cleanly', async () => {
     const result = await new ScheduledTasksProvider({
       now: () => Date.now(),

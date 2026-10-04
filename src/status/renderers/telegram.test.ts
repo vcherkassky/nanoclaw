@@ -28,6 +28,25 @@ describe('renderTelegramStatus', () => {
     expect(out.indexOf('Channels')).toBeLessThan(out.indexOf('Email'));
   });
 
+  it('shows the update time in the given timezone, not UTC', () => {
+    // 12:40 UTC on 4 Oct = 13:40 Irish Summer Time
+    const out = renderTelegramStatus(
+      [],
+      new Date('2026-10-04T12:40:00.000Z'),
+      'Europe/Dublin',
+    );
+    expect(out).toContain('Updated 2026-10-04 13:40 (Europe/Dublin)');
+  });
+
+  it('rolls the date over in the given timezone', () => {
+    const out = renderTelegramStatus(
+      [],
+      new Date('2026-10-04T23:30:00.000Z'),
+      'Asia/Tokyo',
+    );
+    expect(out).toContain('Updated 2026-10-05 08:30 (Asia/Tokyo)');
+  });
+
   it('renders warn line above rows when set', () => {
     const out = renderTelegramStatus(
       [

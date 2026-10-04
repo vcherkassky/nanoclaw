@@ -994,14 +994,18 @@ async function main(): Promise<void> {
             }),
             new AgentRunsProvider(),
             new ModelProxyProvider({ getStats: () => ollamaProxy.getStats() }),
-            new ScheduledTasksProvider(),
+            new ScheduledTasksProvider({ timezone: TIMEZONE }),
             new SystemProvider({ version: pkg.version }),
           ],
         });
 
         const doRefresh = async (): Promise<void> => {
           const contributions = await manager.collectAll();
-          const text = renderTelegramStatus(contributions, new Date());
+          const text = renderTelegramStatus(
+            contributions,
+            new Date(),
+            TIMEZONE,
+          );
           const pinnedKey = `status_pinned_message_id:${mainJid}`;
           const existingId = getRouterState(pinnedKey);
           if (existingId) {

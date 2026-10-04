@@ -1,9 +1,12 @@
 import { _rawDb } from '../../db.js';
+import { formatClock } from '../../timezone.js';
 import { formatRelativeTime } from '../format.js';
 import type { StatusContribution, StatusProvider } from '../types.js';
 
 export interface ScheduledTasksProviderOptions {
   now?: () => number;
+  /** IANA timezone for displayed times; defaults to the system timezone. */
+  timezone?: string;
 }
 
 export class ScheduledTasksProvider implements StatusProvider {
@@ -35,7 +38,7 @@ export class ScheduledTasksProvider implements StatusProvider {
       ? next
           .map(
             (n) =>
-              `${n.id} ${new Date(n.next_run).toISOString().slice(11, 16)}`,
+              `${n.id} ${formatClock(new Date(n.next_run), this.opts.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone, false)}`,
           )
           .join(' · ')
       : '—';

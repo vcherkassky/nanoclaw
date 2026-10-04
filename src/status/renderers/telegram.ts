@@ -1,3 +1,4 @@
+import { formatClock } from '../../timezone.js';
 import type { StatusContribution } from '../types.js';
 
 const TELEGRAM_MAX_CHARS = 4096;
@@ -5,9 +6,9 @@ const TELEGRAM_MAX_CHARS = 4096;
 export function renderTelegramStatus(
   contributions: StatusContribution[],
   now: Date,
+  tz: string = Intl.DateTimeFormat().resolvedOptions().timeZone,
 ): string {
-  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const stamp = now.toISOString().slice(0, 16).replace('T', ' ');
+  const stamp = formatClock(now, tz);
   const header = `📊 NANOCLAW STATUS · Updated ${stamp} (${tz})`;
   const sections = contributions.map((c) => {
     const lines = [c.title];
