@@ -346,6 +346,19 @@ describe('classifyEmail', () => {
     expect(result).toEqual({ safe: true });
   });
 
+  it('does not override num_ctx, so it reuses the runner the agents loaded', async () => {
+    setEnv();
+    const fetchMock = mockOllamaResponse('{"is_safe":true,"reason":"SAFE"}');
+    vi.stubGlobal('fetch', fetchMock);
+
+    await classifyEmail(makeSanitized());
+
+    // A different num_ctx makes Ollama reload the model, which evicts the
+    // agents' prompt cache and turns the next agent turn into a cold start.
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.options?.num_ctx).toBeUndefined();
+  });
+
   it('passes through when JSON schema is invalid (classifier glitch)', async () => {
     setEnv();
     vi.stubGlobal('fetch', mockOllamaResponse('{"reason":"SAFE"}'));
