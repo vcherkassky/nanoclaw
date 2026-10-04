@@ -1,4 +1,5 @@
 import {
+  Agent as HttpAgent,
   createServer as createHttpServer,
   IncomingHttpHeaders,
   IncomingMessage,
@@ -476,6 +477,65 @@ describe('OllamaProxy (pass-through over a fake upstream)', () => {
         await p.close();
       }
     });
+
+    it('drains a large request body so the 502 arrives cleanly and keep-alive survives', async () => {
+      const dead = createHttpServer();
+      const deadPort = await listenOn(dead);
+      await closeServer(dead);
+      const p = new OllamaProxy({
+        realHost: `http://127.0.0.1:${deadPort}`,
+        loadedModelsPollMs: 0,
+      });
+      await p.listen(0);
+      const agent = new HttpAgent({ keepAlive: true, maxSockets: 1 });
+      const send = (body: Buffer) =>
+        new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = httpRequest(
+            {
+              host: '127.0.0.1',
+              port: proxyPort(p),
+              method: 'POST',
+              path: '/api/chat',
+              headers: {
+                'content-type': 'application/json',
+                'content-length': body.length,
+              },
+              agent,
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on('data', (c: Buffer) => chunks.push(c));
+              res.on('end', () =>
+                resolve({
+                  status: res.statusCode!,
+                  body: Buffer.concat(chunks).toString(),
+                }),
+              );
+              res.on('error', reject);
+            },
+          );
+          req.on('error', reject);
+          req.end(body);
+        });
+      try {
+        const big = Buffer.from(
+          `{"model":"M","pad":"${'x'.repeat(20 * 1024 * 1024)}"}`,
+        );
+        const first = await send(big);
+        expect(first.status).toBe(502);
+        expect(JSON.parse(first.body)).toEqual({
+          error: 'upstream unreachable',
+        });
+
+        const t0 = performance.now();
+        const second = await send(Buffer.from('{"model":"M"}'));
+        expect(second.status).toBe(502);
+        expect(performance.now() - t0).toBeLessThan(1000);
+      } finally {
+        agent.destroy();
+        await p.close();
+      }
+    }, 20_000);
 
     it('destroys the client response when the upstream dies mid-stream', async () => {
       upstreamReply = (_req, res) => {

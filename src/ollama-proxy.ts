@@ -302,6 +302,11 @@ export class OllamaProxy {
         'OllamaProxy: upstream request failed',
       );
       if (!res.headersSent) {
+        // Keep reading (and discarding) the rest of the client's body: if it
+        // backs up, a large POST gets EPIPE instead of the 502 and the
+        // keep-alive connection stalls.
+        modelPeek.unpipe(upstreamReq);
+        modelPeek.resume();
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'upstream unreachable' }));
       } else {
