@@ -1,0 +1,3 @@
+# Host-built deps/outputs must not overwrite the image's Linux npm install / tsc build
+agent-runner/node_modules
+agent-runner/dist
