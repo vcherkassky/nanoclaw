@@ -48,6 +48,12 @@ COPY agent-runner/ ./
 # Build TypeScript
 RUN npm run build
 
+# Lift undici's 300 s headers/body timeouts on fetch for every node process
+# (a cold long-prompt prefill can take longer before the first header byte).
+# The Claude Code CLI also gets it via executableArgs, since the SDK strips
+# NODE_OPTIONS from its env. See agent-runner/undici-no-timeout.cjs.
+ENV NODE_OPTIONS="--require /app/undici-no-timeout.cjs"
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 

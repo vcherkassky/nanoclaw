@@ -19,6 +19,7 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { buildDump, estimateTokens, probeSchemas, type ComponentEntry, type McpServerConfig } from './context-dump.js';
+import { claudeCodeExecutableArgs } from './undici-preload.js';
 
 const CONTEXT_DUMP = process.env.NANOCLAW_CONTEXT_DUMP === '1';
 
@@ -465,6 +466,7 @@ async function runQuery(
         'mcp__calendar__*',
       ],
       env: sdkEnv,
+      executableArgs: claudeCodeExecutableArgs(),
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
@@ -671,6 +673,7 @@ async function main(): Promise<void> {
           systemPrompt: undefined,
           allowedTools: [],
           env: sdkEnv,
+          executableArgs: claudeCodeExecutableArgs(),
           permissionMode: 'bypassPermissions' as const,
           allowDangerouslySkipPermissions: true,
           settingSources: ['project', 'user'] as const,
