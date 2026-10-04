@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   extractSessionCommand,
   handleSessionCommand,
+  hasPendingAuthorizedSessionCommand,
   isSessionCommandAllowed,
 } from './session-commands.js';
 import type { NewMessage } from './types.js';
@@ -54,6 +55,67 @@ describe('extractSessionCommand', () => {
 
   it('detects /status with trigger prefix', () => {
     expect(extractSessionCommand('@Andy /status', trigger)).toBe('/status');
+  });
+
+  it('detects bare /clear', () => {
+    expect(extractSessionCommand('/clear', trigger)).toBe('/clear');
+  });
+
+  it('detects /clear with trigger prefix', () => {
+    expect(extractSessionCommand('@Andy /clear', trigger)).toBe('/clear');
+  });
+
+  it('rejects /clear with extra text', () => {
+    expect(extractSessionCommand('/clear everything', trigger)).toBeNull();
+  });
+});
+
+describe('hasPendingAuthorizedSessionCommand', () => {
+  const trigger = /^@Andy\b/i;
+  const msg = (content: string, is_from_me = false) =>
+    ({
+      id: content,
+      chat_jid: 'g',
+      sender: 's',
+      sender_name: 'S',
+      content,
+      timestamp: '1',
+      is_from_me,
+    }) as NewMessage;
+
+  it('is true when an authorized /clear is still pending behind new messages', () => {
+    expect(
+      hasPendingAuthorizedSessionCommand(
+        [msg('/clear'), msg('hello')],
+        true,
+        trigger,
+      ),
+    ).toBe(true);
+  });
+
+  it('is false when nothing pending is a session command', () => {
+    expect(
+      hasPendingAuthorizedSessionCommand([msg('hello')], true, trigger),
+    ).toBe(false);
+  });
+
+  it('ignores commands the sender is not allowed to run', () => {
+    // An untrusted /clear doesn't close the container, so it must not stop
+    // follow-up messages from being piped to it either.
+    expect(
+      hasPendingAuthorizedSessionCommand(
+        [msg('/clear', false), msg('hello')],
+        false,
+        trigger,
+      ),
+    ).toBe(false);
+    expect(
+      hasPendingAuthorizedSessionCommand(
+        [msg('/clear', true), msg('hello')],
+        false,
+        trigger,
+      ),
+    ).toBe(true);
   });
 });
 
@@ -139,40 +201,215 @@ describe('handleSessionCommand', () => {
     expect(deps.advanceCursor).toHaveBeenCalledWith('100');
   });
 
-  it('sends compaction stats after a successful /compact', async () => {
-    const describeCompaction = vi
-      .fn()
-      .mockReturnValue('Compacted: 30,000 → ~1,900 tokens (94% smaller).');
-    const deps = makeDeps({ describeCompaction });
-    await handleSessionCommand({
-      missedMessages: [makeMsg('/compact')],
-      isMainGroup: true,
-      groupName: 'test',
-      triggerPattern: trigger,
-      timezone: 'UTC',
-      deps,
+  describe('/compact outcome reporting', () => {
+    // The agent emits its own text ("Conversation compacted.", or a short
+    // apology) — that must never reach the chat alongside the host message.
+    const agentSays = (text: string, status: 'success' | 'error' = 'success') =>
+      vi.fn().mockImplementation(async (_prompt, onOutput) => {
+        await onOutput({ status, result: text });
+        await onOutput({ status: 'success', result: null });
+        return status;
+      });
+
+    it('sends exactly one stats message when a new boundary was written', async () => {
+      const finish = vi.fn().mockReturnValue({
+        compacted: true,
+        summary: '🗜️ Compacted: 30,000 → ~1,900 tokens (94% smaller).',
+      });
+      const beginCompaction = vi.fn().mockReturnValue(finish);
+      const deps = makeDeps({
+        beginCompaction,
+        runAgent: agentSays('Conversation compacted.'),
+      });
+      const result = await handleSessionCommand({
+        missedMessages: [makeMsg('/compact')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(result).toEqual({ handled: true, success: true });
+      // Snapshot taken before the agent runs, outcome checked after.
+      expect(beginCompaction.mock.invocationCallOrder[0]).toBeLessThan(
+        vi.mocked(deps.runAgent).mock.invocationCallOrder[0],
+      );
+      expect(finish).toHaveBeenCalledOnce();
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      expect(deps.sendMessage).toHaveBeenCalledWith(
+        '🗜️ Compacted: 30,000 → ~1,900 tokens (94% smaller).',
+      );
+      expect(deps.advanceCursor).toHaveBeenCalledWith('100');
     });
-    expect(describeCompaction).toHaveBeenCalledOnce();
-    expect(deps.sendMessage).toHaveBeenCalledWith(
-      'Compacted: 30,000 → ~1,900 tokens (94% smaller).',
-    );
+
+    it('sends exactly one failure message with the reason when no boundary was written', async () => {
+      const deps = makeDeps({
+        beginCompaction: vi.fn().mockReturnValue(() => ({
+          compacted: false,
+          reason:
+            "API Error: Claude's response exceeded the 20000 output token maximum",
+        })),
+        runAgent: agentSays('Sorry, something went wrong.'),
+      });
+      await handleSessionCommand({
+        missedMessages: [makeMsg('/compact')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      const text = vi.mocked(deps.sendMessage).mock.calls[0][0];
+      expect(text).toBe(
+        "⚠️ Compaction failed: API Error: Claude's response exceeded the 20000 output token maximum. Session unchanged — use /clear to start fresh.",
+      );
+      expect(text).not.toContain('Compaction complete');
+    });
+
+    it('sends one generic failure message when no reason is recorded', async () => {
+      const deps = makeDeps({
+        beginCompaction: vi
+          .fn()
+          .mockReturnValue(() => ({ compacted: false, reason: null })),
+        runAgent: agentSays('Conversation compacted.'),
+      });
+      await handleSessionCommand({
+        missedMessages: [makeMsg('/compact')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      const text = vi.mocked(deps.sendMessage).mock.calls[0][0];
+      expect(text).toMatch(/^⚠️ Compaction failed: /);
+      expect(text).toContain('Session unchanged');
+      expect(text).not.toContain('Conversation compacted');
+    });
+
+    it('sends one failure message when the agent itself errors', async () => {
+      const deps = makeDeps({
+        beginCompaction: vi
+          .fn()
+          .mockReturnValue(() => ({ compacted: false, reason: null })),
+        runAgent: agentSays('boom', 'error'),
+      });
+      await handleSessionCommand({
+        missedMessages: [makeMsg('/compact')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.sendMessage).mock.calls[0][0]).toMatch(
+        /^⚠️ Compaction failed: .*agent.*error/i,
+      );
+    });
+
+    it('still reports success if the boundary exists despite an agent error', async () => {
+      const deps = makeDeps({
+        beginCompaction: vi
+          .fn()
+          .mockReturnValue(() => ({ compacted: true, summary: 'stats' })),
+        runAgent: agentSays('late error', 'error'),
+      });
+      await handleSessionCommand({
+        missedMessages: [makeMsg('/compact')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      expect(deps.sendMessage).toHaveBeenCalledWith('stats');
+    });
   });
 
-  it('does not send compaction stats when /compact errors', async () => {
-    const describeCompaction = vi.fn().mockReturnValue('stats');
-    const deps = makeDeps({
-      describeCompaction,
-      runAgent: vi.fn().mockResolvedValue('error'),
+  describe('/clear', () => {
+    it('clears the session host-side, closes any live container and confirms once', async () => {
+      const clearSession = vi.fn().mockResolvedValue(undefined);
+      const deps = makeDeps({ clearSession });
+      const result = await handleSessionCommand({
+        missedMessages: [makeMsg('/clear')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(result).toEqual({ handled: true, success: true });
+      expect(deps.runAgent).not.toHaveBeenCalled();
+      expect(deps.closeStdin).toHaveBeenCalledOnce();
+      // The container is told to close before its session is pulled away.
+      expect(
+        vi.mocked(deps.closeStdin).mock.invocationCallOrder[0],
+      ).toBeLessThan(clearSession.mock.invocationCallOrder[0]);
+      expect(clearSession).toHaveBeenCalledOnce();
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      expect(deps.sendMessage).toHaveBeenCalledWith(
+        '🧹 Session cleared. Your next message starts a fresh conversation (long-term memory in CLAUDE.md is kept).',
+      );
+      expect(deps.advanceCursor).toHaveBeenCalledWith('100');
     });
-    await handleSessionCommand({
-      missedMessages: [makeMsg('/compact')],
-      isMainGroup: true,
-      groupName: 'test',
-      triggerPattern: trigger,
-      timezone: 'UTC',
-      deps,
+
+    it('reports failure (and still consumes the command) when clearing throws', async () => {
+      const deps = makeDeps({
+        clearSession: vi.fn().mockRejectedValue(new Error('EACCES')),
+      });
+      const result = await handleSessionCommand({
+        missedMessages: [makeMsg('/clear')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(result).toEqual({ handled: true, success: true });
+      expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(deps.sendMessage).mock.calls[0][0]).toMatch(
+        /failed to clear/i,
+      );
+      expect(deps.advanceCursor).toHaveBeenCalledWith('100');
     });
-    expect(describeCompaction).not.toHaveBeenCalled();
+
+    it('sends a stub message when clearing is not wired up', async () => {
+      const deps = makeDeps({ clearSession: undefined });
+      await handleSessionCommand({
+        missedMessages: [makeMsg('/clear')],
+        isMainGroup: true,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(deps.sendMessage).toHaveBeenCalledWith(
+        'Session clearing is not available in this build.',
+      );
+    });
+
+    it('is admin-gated like the other session commands', async () => {
+      const clearSession = vi.fn();
+      const deps = makeDeps({ clearSession });
+      const result = await handleSessionCommand({
+        missedMessages: [makeMsg('/clear', { is_from_me: false })],
+        isMainGroup: false,
+        groupName: 'test',
+        triggerPattern: trigger,
+        timezone: 'UTC',
+        deps,
+      });
+      expect(result).toEqual({ handled: true, success: true });
+      expect(clearSession).not.toHaveBeenCalled();
+      expect(deps.closeStdin).not.toHaveBeenCalled();
+      expect(deps.sendMessage).toHaveBeenCalledWith(
+        'Session commands require admin access.',
+      );
+    });
   });
 
   it('handles /status host-side via refreshStatus (no agent invoked, no chat reply)', async () => {

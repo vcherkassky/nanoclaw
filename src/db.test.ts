@@ -8,18 +8,22 @@ import {
   countAgentRunsByModelSince,
   countAgentRunsSince,
   createTask,
+  deleteSession,
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getAllSessions,
   getEmailAttempt,
   getLastAgentRun,
   getMessagesSince,
   getNewMessages,
   getRecentMessages,
+  getSession,
   getTaskById,
   recordAgentRun,
   recordEmailAttempt,
   setRegisteredGroup,
+  setSession,
   storeChatMetadata,
   storeMessage,
   updateTask,
@@ -832,5 +836,23 @@ describe('agent_runs', () => {
 
   it('returns undefined from getLastAgentRun when the table is empty', () => {
     expect(getLastAgentRun()).toBeUndefined();
+  });
+});
+
+describe('sessions', () => {
+  it('deleteSession removes only that group session row', () => {
+    setSession('group_a', 'sess-a');
+    setSession('group_b', 'sess-b');
+
+    deleteSession('group_a');
+
+    expect(getSession('group_a')).toBeUndefined();
+    expect(getSession('group_b')).toBe('sess-b');
+    expect(getAllSessions()).toEqual({ group_b: 'sess-b' });
+  });
+
+  it('deleteSession is a no-op for an unknown group', () => {
+    expect(() => deleteSession('nope')).not.toThrow();
+    expect(getAllSessions()).toEqual({});
   });
 });

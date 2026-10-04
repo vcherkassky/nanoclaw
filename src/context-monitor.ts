@@ -425,21 +425,230 @@ export function describeCompaction(
 ): string {
   const sessionId =
     trackedSessionId ?? findLatestSessionId(groupFolder, opts) ?? undefined;
-  if (!sessionId) return 'Compaction complete.';
+  // Never claim success without a compact_boundary on disk as evidence.
+  if (!sessionId) return 'No compaction recorded — there is no session yet.';
   const e = estimateSessionTokens(sessionId, groupFolder, opts);
-  if (!e.hasCompactBoundary || !e.preCompactTokens) {
-    return 'Compaction complete.';
-  }
+  if (!e.hasCompactBoundary) return 'No compaction recorded for this session.';
   const approx = e.actualInputTokens === null;
   const post = e.actualInputTokens ?? e.estimatedTokens;
-  const pct =
-    e.preCompactTokens > 0
-      ? Math.max(0, Math.round((1 - post / e.preCompactTokens) * 100))
-      : 0;
   const postStr = `${approx ? '~' : ''}${post.toLocaleString()}`;
-  let msg = `🗜️ Compacted: ${e.preCompactTokens.toLocaleString()} → ${postStr} tokens (${pct}% smaller).`;
+  let msg: string;
+  if (e.preCompactTokens) {
+    const pct = Math.max(0, Math.round((1 - post / e.preCompactTokens) * 100));
+    msg = `🗜️ Compacted: ${e.preCompactTokens.toLocaleString()} → ${postStr} tokens (${pct}% smaller).`;
+  } else {
+    msg = `🗜️ Compacted: now ${postStr} tokens.`;
+  }
   if (approx) msg += ' Exact size updates after your next message.';
   return msg;
+}
+
+/** Where a session transcript stood just before `/compact` was sent. */
+export interface CompactionSnapshot {
+  sessionId: string | null;
+  /** Transcript size in bytes; anything after this offset is new. */
+  offset: number;
+}
+
+export type CompactionOutcome =
+  | { compacted: true; summary: string }
+  | { compacted: false; reason: string | null };
+
+const MAX_COMPACTION_REASON_CHARS = 300;
+
+/**
+ * Record the current end of the group's session transcript so that
+ * `checkCompactionOutcome` can tell records written by this `/compact` run
+ * apart from older ones (e.g. a boundary from a previous compaction).
+ * Byte offsets avoid comparing container and host clocks.
+ */
+export function snapshotCompaction(
+  groupFolder: string,
+  trackedSessionId: string | undefined,
+  opts: { dataDir?: string } = {},
+): CompactionSnapshot {
+  const dataDir = opts.dataDir ?? DATA_DIR;
+  const sessionId =
+    trackedSessionId ?? findLatestSessionId(groupFolder, { dataDir });
+  if (!sessionId) return { sessionId: null, offset: 0 };
+  const file = sessionFilePath(dataDir, groupFolder, sessionId);
+  let offset = 0;
+  if (file) {
+    try {
+      offset = fs.statSync(file).size;
+    } catch {
+      // No transcript yet — everything that appears is new.
+    }
+  }
+  return { sessionId, offset };
+}
+
+/** Turn Claude Code's local_command stderr into a short human reason. */
+function cleanCompactionError(raw: string): string | null {
+  let text = raw.replace(/\s+/g, ' ').trim();
+  // "Error: Error during compaction: Error: API Error: …" → "API Error: …"
+  let prev: string;
+  do {
+    prev = text;
+    text = text.replace(/^(?:Error:\s*|Error during compaction:\s*)/i, '');
+  } while (text !== prev);
+  text = text.replace(/[.\s]+$/, '');
+  if (!text) return null;
+  if (text.length > MAX_COMPACTION_REASON_CHARS) {
+    text = text.slice(0, MAX_COMPACTION_REASON_CHARS - 1).trimEnd() + '…';
+  }
+  return text;
+}
+
+/**
+ * Decide whether a `/compact` run actually compacted the session: success
+ * requires a NEW `compact_boundary` record after the snapshot. On failure,
+ * return the reason Claude Code wrote to the transcript's local_command
+ * stderr (e.g. the model overrunning its output-token limit), if any.
+ */
+export function checkCompactionOutcome(
+  groupFolder: string,
+  trackedSessionId: string | undefined,
+  snapshot: CompactionSnapshot,
+  opts: { dataDir?: string } = {},
+): CompactionOutcome {
+  const dataDir = opts.dataDir ?? DATA_DIR;
+  const sessionId =
+    trackedSessionId ?? findLatestSessionId(groupFolder, { dataDir });
+  if (!sessionId) return { compacted: false, reason: null };
+  const file = sessionFilePath(dataDir, groupFolder, sessionId);
+  if (!file) return { compacted: false, reason: null };
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(file);
+  } catch {
+    return { compacted: false, reason: null };
+  }
+  // A different session id (or a file that shrank) means the transcript was
+  // replaced during the run: everything in it is new.
+  const start =
+    sessionId === snapshot.sessionId && snapshot.offset <= buf.length
+      ? snapshot.offset
+      : 0;
+
+  let sawBoundary = false;
+  let reason: string | null = null;
+  for (const line of buf.subarray(start).toString('utf8').split('\n')) {
+    const trimmed = line.trim();
+    if (
+      !trimmed ||
+      !(
+        trimmed.includes('compact_boundary') ||
+        trimmed.includes('local-command-stderr')
+      )
+    ) {
+      continue;
+    }
+    let obj: { subtype?: string; content?: unknown };
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (obj.subtype === 'compact_boundary') {
+      sawBoundary = true;
+    } else if (
+      obj.subtype === 'local_command' &&
+      typeof obj.content === 'string'
+    ) {
+      const m = obj.content.match(
+        /<local-command-stderr>([\s\S]*?)<\/local-command-stderr>/,
+      );
+      const cleaned = m ? cleanCompactionError(m[1]) : null;
+      if (cleaned) reason = cleaned;
+    }
+  }
+
+  if (sawBoundary) {
+    return {
+      compacted: true,
+      summary: describeCompaction(groupFolder, sessionId, {
+        dataDir,
+        ttlMs: 0,
+      }),
+    };
+  }
+  return { compacted: false, reason };
+}
+
+/**
+ * The best available context size for a session: the model-reported prompt
+ * size of the last assistant turn when present (exact), else the bytes/4
+ * transcript estimate. The estimate badly overstates real context (thinking
+ * blocks, base64 tool results and metadata all live in the jsonl), so callers
+ * should label it as estimated.
+ */
+export function effectiveContextTokens(e: SessionEstimate): {
+  tokens: number;
+  exact: boolean;
+} {
+  return e.actualInputTokens !== null
+    ? { tokens: e.actualInputTokens, exact: true }
+    : { tokens: e.estimatedTokens, exact: false };
+}
+
+/**
+ * Move every top-level session transcript (`<id>.jsonl`, plus its sibling
+ * `<id>/` directory of subagent/tool-result files) into `cleared/` under the
+ * same projects dir, as `cleared/<timestamp>-<id>.jsonl`. Used by `/clear`.
+ *
+ * All transcripts are archived, not just the tracked one, because
+ * `findLatestSessionId` adopts whichever top-level jsonl is newest: leaving an
+ * older session in place would let the reconcile fallback (or `/context`)
+ * resurrect it. Nothing is deleted; files stay recoverable from `cleared/`.
+ * Returns the archived session ids.
+ */
+export function archiveSessionFiles(
+  groupFolder: string,
+  opts: { dataDir?: string; now?: Date } = {},
+): string[] {
+  const dataDir = opts.dataDir ?? DATA_DIR;
+  const dir = sessionDirPath(dataDir, groupFolder);
+  if (!dir) return [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const stamp = (opts.now ?? new Date()).toISOString().replace(/[:.]/g, '-');
+  const clearedDir = path.join(dir, 'cleared');
+  const archived: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+    const sessionId = entry.name.slice(0, -'.jsonl'.length);
+    if (!SAFE_NAME.test(sessionId)) continue;
+    fs.mkdirSync(clearedDir, { recursive: true });
+    let base = `${stamp}-${sessionId}`;
+    for (
+      let n = 1;
+      fs.existsSync(path.join(clearedDir, `${base}.jsonl`)) ||
+      fs.existsSync(path.join(clearedDir, base));
+      n++
+    ) {
+      base = `${stamp}-${sessionId}-${n}`;
+    }
+    fs.renameSync(
+      path.join(dir, entry.name),
+      path.join(clearedDir, `${base}.jsonl`),
+    );
+    const siblingDir = path.join(dir, sessionId);
+    try {
+      if (fs.statSync(siblingDir).isDirectory()) {
+        fs.renameSync(siblingDir, path.join(clearedDir, base));
+      }
+    } catch {
+      // No sibling directory for this session.
+    }
+    archived.push(sessionId);
+  }
+  cache.clear();
+  return archived;
 }
 
 /** Clear in-memory cache. Useful for tests; also called after /compact. */

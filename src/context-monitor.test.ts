@@ -5,11 +5,15 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  archiveSessionFiles,
+  checkCompactionOutcome,
   describeCompaction,
   describeGroupContext,
+  effectiveContextTokens,
   estimateSessionTokens,
   findLatestSessionId,
   formatSessionEstimate,
+  snapshotCompaction,
 } from './context-monitor.js';
 
 describe('estimateSessionTokens', () => {
@@ -463,7 +467,7 @@ describe('describeCompaction', () => {
     expect(text).toMatch(/\d+% smaller/);
   });
 
-  it('falls back gracefully when no compaction boundary is present', () => {
+  it('never claims success when no compaction boundary is present', () => {
     writeSession(
       'g',
       'sess1',
@@ -473,7 +477,310 @@ describe('describeCompaction', () => {
       dataDir: path.join(tmpDir, 'data'),
       ttlMs: 0,
     });
-    expect(text.toLowerCase()).toContain('compaction complete');
+    expect(text.toLowerCase()).not.toContain('compaction complete');
+    expect(text.toLowerCase()).toContain('no compaction');
+  });
+
+  it('never claims success when there is no session at all', () => {
+    const text = describeCompaction('g', undefined, {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(text.toLowerCase()).not.toContain('compaction complete');
+  });
+});
+
+// The shape Claude Code writes when /compact fails (captured from a real
+// telegram_main session where the local model overran the output limit).
+const COMPACT_FAILURE_LINE = JSON.stringify({
+  parentUuid: '58dd55fa',
+  isSidechain: false,
+  type: 'system',
+  subtype: 'local_command',
+  content:
+    "<local-command-stderr>Error: Error during compaction: Error: API Error: Claude's response exceeded the 20000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.</local-command-stderr>",
+  level: 'info',
+  timestamp: '2026-10-04T12:52:32.441Z',
+  uuid: '0e001258',
+  sessionId: 'sess1',
+});
+
+const COMPACT_COMMAND_LINE = JSON.stringify({
+  type: 'user',
+  message: {
+    role: 'user',
+    content:
+      '<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>',
+  },
+});
+
+describe('compaction outcome', () => {
+  let tmpDir: string;
+  let dataDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-monitor-outcome-'));
+    dataDir = path.join(tmpDir, 'data');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function sessionFile(sessionId: string): string {
+    const dir = path.join(
+      dataDir,
+      'sessions',
+      'g',
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    return path.join(dir, `${sessionId}.jsonl`);
+  }
+
+  function append(sessionId: string, lines: string[]): void {
+    fs.appendFileSync(sessionFile(sessionId), lines.join('\n') + '\n');
+  }
+
+  const priorBoundary = JSON.stringify({
+    type: 'system',
+    subtype: 'compact_boundary',
+    compact_metadata: { preTokens: 12000 },
+  });
+  const usage = (n: number) =>
+    JSON.stringify({
+      type: 'assistant',
+      message: { model: 'm', usage: { input_tokens: n } },
+    });
+
+  it('reports success with stats when a NEW compact_boundary appears', () => {
+    append('sess1', [usage(30000)]);
+    const snap = snapshotCompaction('g', 'sess1', { dataDir });
+    append('sess1', [
+      COMPACT_COMMAND_LINE,
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        compact_metadata: { preTokens: 30000 },
+      }),
+      JSON.stringify({ type: 'user', content: 'summary' }),
+    ]);
+
+    const outcome = checkCompactionOutcome('g', 'sess1', snap, { dataDir });
+
+    expect(outcome.compacted).toBe(true);
+    if (!outcome.compacted) throw new Error('unreachable');
+    expect(outcome.summary).toContain('30,000');
+    expect(outcome.summary.toLowerCase()).toContain('compacted');
+  });
+
+  it('reports failure with the stderr reason when no new boundary appears', () => {
+    // An OLD boundary from an earlier, successful compaction must not count.
+    append('sess1', [usage(5000), priorBoundary, usage(40000)]);
+    const snap = snapshotCompaction('g', 'sess1', { dataDir });
+    append('sess1', [COMPACT_COMMAND_LINE, COMPACT_FAILURE_LINE]);
+
+    const outcome = checkCompactionOutcome('g', 'sess1', snap, { dataDir });
+
+    expect(outcome.compacted).toBe(false);
+    if (outcome.compacted) throw new Error('unreachable');
+    expect(outcome.reason).toContain(
+      "API Error: Claude's response exceeded the 20000 output token maximum",
+    );
+    expect(outcome.reason).not.toContain('<local-command-stderr>');
+    expect(outcome.reason).not.toMatch(/^Error:/);
+    expect(outcome.reason).not.toMatch(/\.$/);
+  });
+
+  it('reports failure without a reason when nothing new was written', () => {
+    append('sess1', [usage(40000)]);
+    const snap = snapshotCompaction('g', 'sess1', { dataDir });
+
+    const outcome = checkCompactionOutcome('g', 'sess1', snap, { dataDir });
+
+    expect(outcome).toEqual({ compacted: false, reason: null });
+  });
+
+  it('ignores stderr written before the snapshot', () => {
+    append('sess1', [COMPACT_COMMAND_LINE, COMPACT_FAILURE_LINE]);
+    const snap = snapshotCompaction('g', 'sess1', { dataDir });
+
+    const outcome = checkCompactionOutcome('g', 'sess1', snap, { dataDir });
+
+    expect(outcome).toEqual({ compacted: false, reason: null });
+  });
+
+  it('truncates very long failure reasons', () => {
+    append('sess1', [usage(40000)]);
+    const snap = snapshotCompaction('g', 'sess1', { dataDir });
+    append('sess1', [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'local_command',
+        content: `<local-command-stderr>Error: Error during compaction: ${'x'.repeat(2000)}</local-command-stderr>`,
+      }),
+    ]);
+
+    const outcome = checkCompactionOutcome('g', 'sess1', snap, { dataDir });
+
+    if (outcome.compacted) throw new Error('expected failure');
+    expect(outcome.reason!.length).toBeLessThanOrEqual(301);
+    expect(outcome.reason).toMatch(/…$/);
+  });
+
+  it('scans the whole file when the session id changed during the run', () => {
+    append('old', [usage(30000)]);
+    const snap = snapshotCompaction('g', 'old', { dataDir });
+    append('new', [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        compact_metadata: { preTokens: 30000 },
+      }),
+    ]);
+
+    const outcome = checkCompactionOutcome('g', 'new', snap, { dataDir });
+
+    expect(outcome.compacted).toBe(true);
+  });
+
+  it('handles a group with no session at all', () => {
+    const snap = snapshotCompaction('g', undefined, { dataDir });
+    const outcome = checkCompactionOutcome('g', undefined, snap, { dataDir });
+    expect(outcome).toEqual({ compacted: false, reason: null });
+  });
+});
+
+describe('archiveSessionFiles', () => {
+  let tmpDir: string;
+  let dataDir: string;
+  let projDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctx-monitor-archive-'));
+    dataDir = path.join(tmpDir, 'data');
+    projDir = path.join(
+      dataDir,
+      'sessions',
+      'g',
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(projDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('moves every top-level session jsonl (and sibling dir) into cleared/', () => {
+    fs.writeFileSync(path.join(projDir, 'current.jsonl'), 'current');
+    fs.writeFileSync(path.join(projDir, 'older.jsonl'), 'older');
+    fs.mkdirSync(path.join(projDir, 'current', 'subagents'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(projDir, 'current', 'subagents', 'a.jsonl'),
+      'a',
+    );
+    // Not a session transcript: must be left alone.
+    fs.writeFileSync(path.join(projDir, 'x.jsonl.bak.1'), 'bak');
+
+    const archived = archiveSessionFiles('g', {
+      dataDir,
+      now: new Date('2026-10-04T12:00:00.000Z'),
+    });
+
+    expect(archived.sort()).toEqual(['current', 'older']);
+    const top = fs.readdirSync(projDir).sort();
+    expect(top).toEqual(['cleared', 'x.jsonl.bak.1']);
+    const cleared = fs.readdirSync(path.join(projDir, 'cleared')).sort();
+    expect(cleared).toEqual([
+      '2026-10-04T12-00-00-000Z-current',
+      '2026-10-04T12-00-00-000Z-current.jsonl',
+      '2026-10-04T12-00-00-000Z-older.jsonl',
+    ]);
+    // Content preserved (recoverable, never deleted).
+    expect(
+      fs.readFileSync(
+        path.join(projDir, 'cleared', '2026-10-04T12-00-00-000Z-current.jsonl'),
+        'utf8',
+      ),
+    ).toBe('current');
+    expect(
+      fs.existsSync(
+        path.join(
+          projDir,
+          'cleared',
+          '2026-10-04T12-00-00-000Z-current',
+          'subagents',
+          'a.jsonl',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('makes archived sessions invisible to findLatestSessionId and /context', () => {
+    fs.writeFileSync(path.join(projDir, 'current.jsonl'), 'x'.repeat(800));
+
+    archiveSessionFiles('g', { dataDir });
+
+    expect(findLatestSessionId('g', { dataDir })).toBeNull();
+    expect(
+      describeGroupContext('g', undefined, { dataDir, ttlMs: 0 }).toLowerCase(),
+    ).toContain('no active session yet');
+  });
+
+  it('does not overwrite an earlier archive with the same name', () => {
+    const now = new Date('2026-10-04T12:00:00.000Z');
+    fs.writeFileSync(path.join(projDir, 's.jsonl'), 'first');
+    archiveSessionFiles('g', { dataDir, now });
+    fs.writeFileSync(path.join(projDir, 's.jsonl'), 'second');
+    archiveSessionFiles('g', { dataDir, now });
+
+    const cleared = fs.readdirSync(path.join(projDir, 'cleared'));
+    expect(cleared).toHaveLength(2);
+    const contents = cleared
+      .map((f) => fs.readFileSync(path.join(projDir, 'cleared', f), 'utf8'))
+      .sort();
+    expect(contents).toEqual(['first', 'second']);
+  });
+
+  it('returns [] when the session directory does not exist', () => {
+    expect(archiveSessionFiles('missing', { dataDir })).toEqual([]);
+  });
+
+  it('rejects unsafe group folders', () => {
+    expect(archiveSessionFiles('../escape', { dataDir })).toEqual([]);
+  });
+});
+
+describe('effectiveContextTokens', () => {
+  const base = {
+    sessionId: 's',
+    bytes: 884000,
+    estimatedTokens: 221000,
+    totalBytes: 884000,
+    hasCompactBoundary: false,
+    preCompactTokens: null,
+    exists: true,
+    sessionFile: '/p',
+    model: 'gemma4:26b',
+  };
+
+  it('prefers the model-reported size when available', () => {
+    expect(
+      effectiveContextTokens({ ...base, actualInputTokens: 50912 }),
+    ).toEqual({ tokens: 50912, exact: true });
+  });
+
+  it('falls back to the byte estimate when no usage was reported', () => {
+    expect(
+      effectiveContextTokens({ ...base, actualInputTokens: null }),
+    ).toEqual({ tokens: 221000, exact: false });
   });
 });
 

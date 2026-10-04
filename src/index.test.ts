@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // --- Mocks ---
 
+const H = vi.hoisted(() => ({
+  dataDir: `${process.env.TMPDIR ?? '/tmp'}/nanoclaw-index-test-${process.pid}`,
+}));
+
 vi.mock('./config.js', () => ({
   ASSISTANT_NAME: 'Claw',
   TRIGGER_PATTERN: /@Claw/i,
@@ -10,6 +14,11 @@ vi.mock('./config.js', () => ({
   TIMEZONE: 'UTC',
   CREDENTIAL_PROXY_PORT: 9999,
   PUBLIC_INBOX_TARGET_JID: 'pa-inbox@g.us',
+  DATA_DIR: H.dataDir,
+  CONTEXT_WARN_TOKENS: 80_000,
+  MODEL_CONTEXT_LIMITS: {},
+  DEFAULT_CONTEXT_LIMIT: 0,
+  MAX_CONCURRENT_CONTAINERS: 2,
 }));
 
 vi.mock('./logger.js', () => ({
@@ -35,6 +44,7 @@ vi.mock('./db.js', () => ({
   getRegisteredGroup: vi.fn(),
   setRegisteredGroup: vi.fn(),
   setSession: vi.fn(),
+  deleteSession: vi.fn(),
   storeMessage: vi.fn(),
   storeChatMetadata: vi.fn(),
 }));
@@ -98,7 +108,15 @@ vi.mock('fs', async () => {
 // --- Imports (after mocks) ---
 
 import fs from 'fs';
-import { getMessagesSince, getAllTasks } from './db.js';
+import path from 'path';
+import {
+  deleteSession,
+  getMessagesSince,
+  getAllTasks,
+  setSession,
+} from './db.js';
+import { GroupQueue } from './group-queue.js';
+import { clearContextMonitorCache } from './context-monitor.js';
 import {
   runContainerAgent,
   writeTasksSnapshot,
@@ -111,6 +129,7 @@ import {
   _resetLastAgentTimestamp,
   _setChannels,
   _setRegisteredGroups,
+  _setSessions,
 } from './index.js';
 
 // --- Helpers ---
@@ -357,5 +376,278 @@ describe('processEmailHeadless', () => {
     await expect(_processEmailHeadless(makeEmailMsg() as any)).rejects.toThrow(
       'container timeout',
     );
+  });
+});
+
+// --- Session lifecycle: /clear, /context, reconcile, batching, warnings ---
+
+describe('processGroupMessages — session lifecycle', () => {
+  const projDir = path.join(
+    H.dataDir,
+    'sessions',
+    TEST_GROUP.folder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+  );
+  let realFs: typeof import('fs');
+  let store: Array<Record<string, unknown>>;
+  let seq: number;
+  let channel: ReturnType<typeof makeMockChannel>;
+
+  function say(content: string) {
+    seq++;
+    store.push({
+      id: `m${seq}`,
+      chat_jid: GROUP_JID,
+      sender: 'user@s.whatsapp.net',
+      content,
+      timestamp: `2026-01-02T00:00:${String(seq).padStart(2, '0')}.000Z`,
+      is_from_me: true,
+      is_bot_message: false,
+    });
+  }
+
+  function writeSession(id: string, body = 'x\n', mtimeMs?: number) {
+    realFs.mkdirSync(projDir, { recursive: true });
+    const file = path.join(projDir, `${id}.jsonl`);
+    realFs.writeFileSync(file, body);
+    if (mtimeMs) realFs.utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
+  }
+
+  /** One normal turn in which the agent reports `sessionId` as its session. */
+  async function turnWithSession(sessionId: string) {
+    say('@Claw hi');
+    vi.mocked(runContainerAgent).mockImplementationOnce(
+      async (_g, _i, _r, onOutput) => {
+        await onOutput?.({
+          status: 'success',
+          result: 'hello',
+          newSessionId: sessionId,
+        });
+        return { status: 'success', result: null, newSessionId: sessionId };
+      },
+    );
+    await _processGroupMessages(GROUP_JID);
+  }
+
+  const sent = () => channel.sendMessage.mock.calls.map((c) => c[1]);
+
+  beforeEach(async () => {
+    realFs = await vi.importActual<typeof import('fs')>('fs');
+    realFs.rmSync(H.dataDir, { recursive: true, force: true });
+    // index.test mocks fs.mkdirSync/writeFileSync as no-ops; the archive and
+    // IPC code under test need real directories here.
+    vi.mocked(fs.mkdirSync).mockImplementation(realFs.mkdirSync as any);
+    clearContextMonitorCache();
+    store = [];
+    seq = 0;
+    _setRegisteredGroups({ [GROUP_JID]: TEST_GROUP });
+    _setSessions({});
+    _resetLastAgentTimestamp();
+    channel = makeMockChannel();
+    _setChannels([channel as any]);
+    vi.mocked(findChannel).mockReturnValue(channel as any);
+    vi.mocked(getMessagesSince).mockImplementation(
+      (_jid: string, since: string) =>
+        store.filter((m) => (m.timestamp as string) > since) as any,
+    );
+  });
+
+  afterEach(() => {
+    vi.mocked(fs.mkdirSync).mockReset();
+    vi.mocked(runContainerAgent).mockReset();
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+    realFs.rmSync(H.dataDir, { recursive: true, force: true });
+  });
+
+  describe('/clear', () => {
+    it('drops the tracked session, archives every transcript and confirms', async () => {
+      writeSession('older-sess', 'old\n', Date.now() - 60_000);
+      writeSession('cur-sess', 'cur\n');
+      realFs.mkdirSync(path.join(projDir, 'cur-sess', 'subagents'), {
+        recursive: true,
+      });
+      await turnWithSession('cur-sess');
+      expect(setSession).toHaveBeenCalledWith(TEST_GROUP.folder, 'cur-sess');
+      channel.sendMessage.mockClear();
+      vi.mocked(runContainerAgent).mockClear();
+
+      say('/clear');
+      const ok = await _processGroupMessages(GROUP_JID);
+
+      expect(ok).toBe(true);
+      expect(runContainerAgent).not.toHaveBeenCalled();
+      expect(deleteSession).toHaveBeenCalledWith(TEST_GROUP.folder);
+      expect(sent()).toEqual([
+        '🧹 Session cleared. Your next message starts a fresh conversation (long-term memory in CLAUDE.md is kept).',
+      ]);
+      expect(realFs.readdirSync(projDir)).toEqual(['cleared']);
+      const archived = realFs.readdirSync(path.join(projDir, 'cleared'));
+      expect(
+        archived.filter((f) => f.endsWith('-cur-sess.jsonl')),
+      ).toHaveLength(1);
+      expect(
+        archived.filter((f) => f.endsWith('-older-sess.jsonl')),
+      ).toHaveLength(1);
+      expect(archived.filter((f) => f.endsWith('-cur-sess'))).toHaveLength(1);
+    });
+
+    it('makes /context report no session afterwards', async () => {
+      writeSession('cur-sess', 'x'.repeat(4000));
+      await turnWithSession('cur-sess');
+      say('/clear');
+      await _processGroupMessages(GROUP_JID);
+      channel.sendMessage.mockClear();
+
+      say('/context');
+      await _processGroupMessages(GROUP_JID);
+
+      expect(sent()).toHaveLength(1);
+      expect(sent()[0].toLowerCase()).toContain('no active session yet');
+      expect(sent()[0]).not.toContain('cur-sess'.slice(0, 8));
+    });
+
+    it('starts the next message with no sessionId and tracks the new session', async () => {
+      writeSession('cur-sess');
+      await turnWithSession('cur-sess');
+      say('/clear');
+      await _processGroupMessages(GROUP_JID);
+      vi.mocked(setSession).mockClear();
+
+      let seenSessionId: string | undefined = 'unset';
+      say('@Claw fresh start');
+      vi.mocked(runContainerAgent).mockImplementationOnce(
+        async (_g, input, _r, onOutput) => {
+          seenSessionId = input.sessionId;
+          await onOutput?.({
+            status: 'success',
+            result: 'hi again',
+            newSessionId: 'brand-new',
+          });
+          return { status: 'success', result: null, newSessionId: 'brand-new' };
+        },
+      );
+      await _processGroupMessages(GROUP_JID);
+
+      expect(seenSessionId).toBeUndefined();
+      expect(setSession).toHaveBeenCalledWith(TEST_GROUP.folder, 'brand-new');
+    });
+
+    it('reconcile fallback never re-adopts an archived session', async () => {
+      writeSession('cur-sess');
+      await turnWithSession('cur-sess');
+      say('/clear');
+      await _processGroupMessages(GROUP_JID);
+      vi.mocked(setSession).mockClear();
+
+      // Streaming marker lost and no new transcript on disk.
+      say('@Claw are you there');
+      vi.mocked(runContainerAgent).mockResolvedValueOnce({
+        status: 'success',
+        result: null,
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(setSession).not.toHaveBeenCalled();
+
+      // Streaming marker lost, but the fresh session's transcript exists:
+      // the fallback must pick it, not anything from cleared/.
+      say('@Claw again');
+      vi.mocked(runContainerAgent).mockImplementationOnce(async () => {
+        writeSession('fresh-on-disk');
+        return { status: 'success', result: null };
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(setSession).toHaveBeenCalledTimes(1);
+      expect(setSession).toHaveBeenCalledWith(
+        TEST_GROUP.folder,
+        'fresh-on-disk',
+      );
+    });
+  });
+
+  describe('queued session commands', () => {
+    it('re-enqueues the group when more messages are pending after a handled command', async () => {
+      const enqueue = vi
+        .spyOn(GroupQueue.prototype, 'enqueueMessageCheck')
+        .mockImplementation(() => {});
+      say('/status');
+      say('/context');
+
+      await _processGroupMessages(GROUP_JID);
+      expect(sent()).toEqual(['Status digest is not configured.']);
+      expect(enqueue).toHaveBeenCalledWith(GROUP_JID);
+
+      // The drain run handles the second command.
+      enqueue.mockClear();
+      await _processGroupMessages(GROUP_JID);
+      expect(sent()[1].toLowerCase()).toContain('no active session yet');
+      expect(enqueue).not.toHaveBeenCalled();
+    });
+
+    it('does not re-enqueue when the command was the last pending message', async () => {
+      const enqueue = vi
+        .spyOn(GroupQueue.prototype, 'enqueueMessageCheck')
+        .mockImplementation(() => {});
+      say('/context');
+      await _processGroupMessages(GROUP_JID);
+      expect(enqueue).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('context-size warning', () => {
+    const usageLine = (n: number) =>
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'gemma4:26b', usage: { input_tokens: n } },
+      });
+    // ~400 kB of transcript → bytes/4 ≈ 100k tokens, above the 80k threshold.
+    const padding = JSON.stringify({ type: 'user', pad: 'p'.repeat(400_000) });
+
+    const warnings = () =>
+      sent().filter((t: string) => t.includes('Conversation context at'));
+
+    it('uses the model-reported size and stays quiet when it is under the threshold', async () => {
+      writeSession('warn-a', `${padding}\n${usageLine(50_912)}\n`);
+      await turnWithSession('warn-a');
+      say('@Claw next');
+      vi.mocked(runContainerAgent).mockResolvedValueOnce({
+        status: 'success',
+        result: null,
+        newSessionId: 'warn-a',
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(warnings()).toEqual([]);
+    });
+
+    it('reports the model-reported size without "estimated" when over the threshold', async () => {
+      writeSession('warn-b', `${usageLine(90_000)}\n`);
+      await turnWithSession('warn-b');
+      say('@Claw next');
+      vi.mocked(runContainerAgent).mockResolvedValueOnce({
+        status: 'success',
+        result: null,
+        newSessionId: 'warn-b',
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(warnings()).toHaveLength(1);
+      expect(warnings()[0]).toContain('at 90k tokens');
+      expect(warnings()[0]).not.toContain('estimated');
+    });
+
+    it('falls back to the byte estimate, labelled as such, when no usage is recorded', async () => {
+      writeSession('warn-c', `${padding}\n`);
+      await turnWithSession('warn-c');
+      say('@Claw next');
+      vi.mocked(runContainerAgent).mockResolvedValueOnce({
+        status: 'success',
+        result: null,
+        newSessionId: 'warn-c',
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(warnings()).toHaveLength(1);
+      expect(warnings()[0]).toMatch(/at ~100k tokens \(estimated\)/);
+    });
   });
 });

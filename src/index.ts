@@ -28,10 +28,13 @@ import { SystemProvider } from './status/providers/system.js';
 import { renderTelegramStatus } from './status/renderers/telegram.js';
 import { StatusScheduler } from './status/scheduler.js';
 import {
-  describeCompaction,
+  archiveSessionFiles,
+  checkCompactionOutcome,
   describeGroupContext,
+  effectiveContextTokens,
   estimateSessionTokens,
   findLatestSessionId,
+  snapshotCompaction,
 } from './context-monitor.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import { OllamaProxy } from './ollama-proxy.js';
@@ -52,6 +55,7 @@ import {
   PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
+  deleteSession,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -85,6 +89,7 @@ import {
 import {
   extractSessionCommand,
   handleSessionCommand,
+  hasPendingAuthorizedSessionCommand,
   isSessionCommandAllowed,
 } from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
@@ -180,6 +185,11 @@ export function _setRegisteredGroups(
 }
 
 /** @internal - exported for testing */
+export function _setSessions(s: Record<string, string>): void {
+  sessions = s;
+}
+
+/** @internal - exported for testing */
 export function _setChannels(ch: Channel[]): void {
   channels.length = 0;
   channels.push(...ch);
@@ -196,6 +206,27 @@ export function _resetLastAgentTimestamp(): void {
 export { processGroupMessages as _processGroupMessages };
 /** @internal - exported for testing */
 export { processEmailHeadless as _processEmailHeadless };
+
+/**
+ * `/clear`: forget the group's agent session so the next message starts a
+ * fresh one. Transcripts are archived (not deleted) so neither the reconcile
+ * fallback in runAgent nor `/context` can re-adopt them. The group's CLAUDE.md
+ * (long-term memory) is untouched. Tracking is dropped even if archiving
+ * fails part-way, so the next run never resumes the cleared session by id.
+ */
+function clearGroupSession(group: RegisteredGroup): void {
+  const previous = sessions[group.folder] ?? null;
+  try {
+    const archived = archiveSessionFiles(group.folder);
+    logger.info(
+      { group: group.folder, previous, archived },
+      'Session cleared; transcripts archived',
+    );
+  } finally {
+    delete sessions[group.folder];
+    deleteSession(group.folder);
+  }
+}
 
 /**
  * Process all pending messages for a group.
@@ -254,28 +285,63 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
       describeContext: () =>
         describeGroupContext(group.folder, sessions[group.folder]),
-      describeCompaction: () =>
-        describeCompaction(group.folder, sessions[group.folder]),
+      beginCompaction: () => {
+        const snapshot = snapshotCompaction(
+          group.folder,
+          sessions[group.folder],
+        );
+        return () =>
+          checkCompactionOutcome(
+            group.folder,
+            sessions[group.folder],
+            snapshot,
+          );
+      },
+      clearSession: () => clearGroupSession(group),
       refreshStatus: refreshStatus ? () => refreshStatus!() : undefined,
     },
   });
-  if (cmdResult.handled) return cmdResult.success;
+  if (cmdResult.handled) {
+    // A command only consumes messages up to itself. Anything queued behind it
+    // (e.g. "/status" then "/context" sent together) would otherwise sit in
+    // the DB until some unrelated message arrives. The cursor strictly
+    // advanced, so re-enqueueing always makes progress; while this run is
+    // active the queue just marks it pending and drains it right after.
+    if (
+      cmdResult.success &&
+      getMessagesSince(
+        chatJid,
+        lastAgentTimestamp[chatJid] || '',
+        ASSISTANT_NAME,
+      ).length > 0
+    ) {
+      queue.enqueueMessageCheck(chatJid);
+    }
+    return cmdResult.success;
+  }
   // --- End session command interception ---
 
   // --- Context-size warning ---
   // Fire once per session ID. After /compact succeeds the SDK returns a new
   // session ID, so the next message's check will see a fresh (small) file
   // and the warning is naturally re-armed.
+  // Prefer the model-reported prompt size; the bytes/4 transcript estimate
+  // overstates real context ~4× (thinking blocks, base64 tool results, and
+  // metadata all live in the jsonl), so it's only a labelled fallback.
   const activeSessionId = sessions[group.folder];
   if (activeSessionId && !warnedContextSessions.has(activeSessionId)) {
     const est = estimateSessionTokens(activeSessionId, group.folder);
-    if (est.estimatedTokens >= CONTEXT_WARN_TOKENS) {
+    const { tokens, exact } = effectiveContextTokens(est);
+    if (tokens >= CONTEXT_WARN_TOKENS) {
       warnedContextSessions.add(activeSessionId);
-      const k = Math.round(est.estimatedTokens / 1000);
+      const k = Math.round(tokens / 1000);
+      const size = exact ? `${k}k tokens` : `~${k}k tokens (estimated)`;
       logger.warn(
         {
           group: group.name,
           sessionId: activeSessionId,
+          contextTokens: tokens,
+          tokenSource: exact ? 'model-reported' : 'estimated',
           estimatedTokens: est.estimatedTokens,
         },
         'Session context above warning threshold',
@@ -283,7 +349,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       channel
         .sendMessage(
           chatJid,
-          `⚠️ Conversation context at ~${k}k tokens. Send \`/compact\` to summarize history and prevent slowdowns. (\`/context\` to recheck.)`,
+          `⚠️ Conversation context at ${size}. Send \`/compact\` to summarize history and prevent slowdowns. (\`/context\` to recheck.)`,
         )
         .catch((err) =>
           logger.warn({ chatJid, err }, 'Failed to send context warning'),
@@ -739,7 +805,19 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend, TIMEZONE);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // A session command from an earlier poll is still waiting for the
+          // closing container to exit (e.g. "/clear" then "hi"): don't pipe,
+          // or the cursor would skip the command and "hi" would land in the
+          // old session. Enqueue so both are handled in order.
+          if (
+            hasPendingAuthorizedSessionCommand(
+              messagesToSend,
+              isMainGroup,
+              TRIGGER_PATTERN,
+            )
+          ) {
+            queue.enqueueMessageCheck(chatJid);
+          } else if (queue.sendMessage(chatJid, formatted)) {
             logger.info(
               { group: group.name, count: messagesToSend.length },
               'Piped messages to active container',

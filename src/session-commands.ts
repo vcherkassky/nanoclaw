@@ -1,3 +1,4 @@
+import type { CompactionOutcome } from './context-monitor.js';
 import type { NewMessage } from './types.js';
 import { logger } from './logger.js';
 
@@ -14,12 +15,15 @@ export function extractSessionCommand(
   if (text === '/compact') return '/compact';
   if (text === '/context') return '/context';
   if (text === '/status') return '/status';
+  if (text === '/clear') return '/clear';
   return null;
 }
 
 /** Commands that are handled entirely on the host (no agent invocation). */
-const HOST_HANDLED = new Set(['/context', '/status']);
+const HOST_HANDLED = new Set(['/context', '/status', '/clear']);
 
+export const CLEAR_CONFIRMATION =
+  '🧹 Session cleared. Your next message starts a fresh conversation (long-term memory in CLAUDE.md is kept).';
 /**
  * Check if a session command sender is authorized.
  * Allowed: main group (any sender), or trusted/admin sender (is_from_me) in any group.
@@ -29,6 +33,25 @@ export function isSessionCommandAllowed(
   isFromMe: boolean,
 ): boolean {
   return isMainGroup || isFromMe;
+}
+
+/**
+ * True if `pending` (messages past the group's cursor) still holds a session
+ * command the sender may run. The message loop must not pipe follow-ups into
+ * a live container in that case: doing so advances the cursor past the
+ * command (so it is never handled) and, for /clear, would deliver the
+ * follow-up into the session that is about to be cleared.
+ */
+export function hasPendingAuthorizedSessionCommand(
+  pending: NewMessage[],
+  isMainGroup: boolean,
+  triggerPattern: RegExp,
+): boolean {
+  return pending.some(
+    (m) =>
+      extractSessionCommand(m.content, triggerPattern) !== null &&
+      isSessionCommandAllowed(isMainGroup, m.is_from_me === true),
+  );
 }
 
 /** Minimal agent result interface — matches the subset of ContainerOutput used here. */
@@ -52,10 +75,25 @@ export interface SessionCommandDeps {
   canSenderInteract: (msg: NewMessage) => boolean;
   /** Returns a human-readable summary of current session context size. Used by /context. */
   describeContext?: () => string;
-  /** Returns a one-line compaction summary (tokens before/after). Used by /compact. */
-  describeCompaction?: () => string;
+  /**
+   * Called just before /compact is sent to the agent; snapshots the session
+   * transcript and returns a checker to call afterwards that reports whether
+   * a new compact_boundary was written (with stats) or why it failed.
+   * When provided, the agent's own /compact text is suppressed so exactly one
+   * host message reports the outcome.
+   */
+  beginCompaction?: () => () => CompactionOutcome;
+  /**
+   * Forgets the group's tracked session and archives its transcripts so the
+   * next message starts a fresh agent session. Used by /clear.
+   */
+  clearSession?: () => void | Promise<void>;
   /** Triggers an immediate status digest refresh. Used by /status. */
   refreshStatus?: () => Promise<void>;
+}
+
+function compactionFailureMessage(reason: string): string {
+  return `⚠️ Compaction failed: ${reason}. Session unchanged — use /clear to start fresh.`;
 }
 
 function resultToText(result: string | object | null | undefined): string {
@@ -124,6 +162,25 @@ export async function handleSessionCommand(opts: {
       } else {
         await deps.sendMessage('Status digest is not configured.');
       }
+    } else if (command === '/clear') {
+      // Defensive: this runs inside processGroupMessages, which the GroupQueue
+      // serializes per group, so no container for this group is normally
+      // alive here (the message loop already wrote _close to any idle one
+      // when the command arrived). closeStdin no-ops when nothing is running.
+      deps.closeStdin();
+      if (deps.clearSession) {
+        try {
+          await deps.clearSession();
+          await deps.sendMessage(CLEAR_CONFIRMATION);
+        } catch (err) {
+          logger.error({ err, group: groupName }, '/clear failed');
+          await deps.sendMessage('Failed to clear the session; see logs.');
+        }
+      } else {
+        await deps.sendMessage(
+          'Session clearing is not available in this build.',
+        );
+      }
     } else {
       const text = deps.describeContext
         ? deps.describeContext()
@@ -178,23 +235,40 @@ export async function handleSessionCommand(opts: {
   // Forward the literal slash command as the prompt (no XML formatting)
   await deps.setTyping(true);
 
+  // For /compact, the host reports the outcome from the transcript itself; the
+  // agent's text ("Conversation compacted.", or an apology from a local model)
+  // is not evidence of anything and would make a second message.
+  const finishCompaction =
+    command === '/compact' ? deps.beginCompaction?.() : undefined;
+
   let hadCmdError = false;
   const cmdOutput = await deps.runAgent(command, async (result) => {
     if (result.status === 'error') hadCmdError = true;
+    if (finishCompaction) return;
     const text = resultToText(result.result);
     if (text) await deps.sendMessage(text);
   });
+  const agentFailed = cmdOutput === 'error' || hadCmdError;
 
-  // Advance cursor to the command — messages AFTER it remain pending for next poll.
+  // Advance cursor to the command — messages AFTER it remain pending.
   deps.advanceCursor(cmdMsg.timestamp);
   await deps.setTyping(false);
 
-  if (cmdOutput === 'error' || hadCmdError) {
+  if (finishCompaction) {
+    const outcome = finishCompaction();
+    if (outcome.compacted) {
+      await deps.sendMessage(outcome.summary);
+    } else {
+      const reason =
+        outcome.reason ??
+        (agentFailed
+          ? 'the agent reported an error'
+          : 'no compaction was recorded in the session');
+      logger.warn({ group: groupName, reason }, '/compact did not compact');
+      await deps.sendMessage(compactionFailureMessage(reason));
+    }
+  } else if (agentFailed) {
     await deps.sendMessage(`${command} failed. The session is unchanged.`);
-  } else if (command === '/compact' && deps.describeCompaction) {
-    // /compact often returns no text (esp. on Ollama); surface the stats so the
-    // user can see how much was summarized.
-    await deps.sendMessage(deps.describeCompaction());
   }
 
   return { handled: true, success: true };
