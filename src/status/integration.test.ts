@@ -72,10 +72,8 @@ describe('status integration', () => {
         }),
         new ModelProxyProvider({
           getStats: () => ({
-            currentModel: 'gemma4:26b',
-            evictions: 1,
+            loadedModels: ['gemma4:26b'],
             requests: 12,
-            lastEvictionAt: '2026-06-28T08:00:00.000Z',
           }),
         }),
         new ScheduledTasksProvider({

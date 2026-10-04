@@ -190,8 +190,8 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Lock wait p95",
-      "description": "95th percentile time a request queued for the single-model lock",
+      "title": "TTFB p95",
+      "description": "95th percentile time to first upstream byte across all requests (includes prompt prefill)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -205,7 +205,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(ollama_proxy_lock_wait_duration_bucket[15m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(ollama_proxy_time_to_first_byte_bucket[15m])))",
           "legendFormat": "__auto",
           "instant": true
         }
@@ -245,85 +245,24 @@
       }
     },
     {
-      "id": 5,
+      "id": 6,
       "type": "stat",
-      "title": "Evictions (range)",
-      "description": "Model swaps in the selected time range; should stay at 0",
+      "title": "Loaded models",
+      "description": "Models Ollama reports as loaded (polled from /api/ps every 15 s)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 8,
         "x": 16,
         "y": 0
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(ollama_proxy_evictions_total[$__range])) or vector(0)",
-          "legendFormat": "__auto",
-          "instant": true
-        }
-      ],
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "colorMode": "background",
-        "graphMode": "none",
-        "textMode": "value",
-        "justifyMode": "center"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 1
-              }
-            ]
-          },
-          "decimals": 0,
-          "noValue": "\u2014"
-        },
-        "overrides": []
-      }
-    },
-    {
-      "id": 6,
-      "type": "stat",
-      "title": "Loaded model",
-      "description": "Model the proxy believes is loaded (may be stale after Ollama's keep_alive expiry)",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
-        "y": 0
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "ollama_proxy_loaded_model",
+          "expr": "ollama_loaded_models == 1",
           "legendFormat": "{{model}}",
           "instant": true
         }
@@ -560,8 +499,8 @@
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Lock wait",
-      "description": "Time model-loading requests wait for the swap lock (e.g. classifier queued behind an agent turn)",
+      "title": "Time to first byte p95 by endpoint",
+      "description": "Time from request to first upstream byte; for /v1 endpoints (no Ollama timings) this is the prompt prefill time",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -575,13 +514,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(ollama_proxy_lock_wait_duration_bucket[$__rate_interval])))",
-          "legendFormat": "p95"
-        },
-        {
-          "refId": "B",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(ollama_proxy_lock_wait_duration_bucket[$__rate_interval])))",
-          "legendFormat": "p50"
+          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(ollama_proxy_time_to_first_byte_bucket[$__rate_interval])))",
+          "legendFormat": "{{path}}"
         }
       ],
       "fieldConfig": {

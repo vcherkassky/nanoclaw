@@ -13,6 +13,7 @@
 import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
+import { pipeline } from 'stream';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
@@ -89,11 +90,28 @@ export function startCredentialProxy(
           } as RequestOptions,
           (upRes) => {
             res.writeHead(upRes.statusCode!, upRes.headers);
-            upRes.pipe(res);
+            // pipeline destroys upRes (and its socket) if res closes early
+            pipeline(upRes, res, () => {});
           },
         );
 
+        // If the client (container) goes away before the response is done,
+        // cancel the upstream request so the work stops end to end.
+        let clientGone = false;
+        res.on('close', () => {
+          if (res.writableFinished) return;
+          clientGone = true;
+          upstream.destroy();
+        });
+
         upstream.on('error', (err) => {
+          if (clientGone) {
+            logger.debug(
+              { url: req.url },
+              'Credential proxy: client disconnected, upstream cancelled',
+            );
+            return;
+          }
           logger.error(
             { err, url: req.url },
             'Credential proxy upstream error',

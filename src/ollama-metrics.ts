@@ -3,8 +3,8 @@
  * format via the proxy's own GET /metrics route (no extra port).
  *
  * Two families:
- *  - proxy behaviour: request counts/latency, lock wait, evictions,
- *    upstream errors, currently loaded model
+ *  - proxy behaviour: request counts/latency, time to first byte,
+ *    upstream errors, models loaded in Ollama (polled from /api/ps)
  *  - inference stats parsed from Ollama's responses: token usage
  *    (GenAI semantic conventions), tokens/sec, load and prompt-eval time
  */
@@ -32,8 +32,14 @@ export interface RequestLabels {
   status: number;
 }
 
+export interface TimeToFirstByteLabels {
+  path: string;
+  model?: string;
+}
+
 const SECONDS_BUCKETS = [
   0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300,
+  600, 1200,
 ];
 const TOKEN_BUCKETS = [1, 4, 16, 64, 256, 1024, 4096, 16384, 65536, 262144];
 const TPS_BUCKETS = [1, 2, 5, 10, 20, 30, 50, 75, 100, 150, 200, 300];
@@ -161,7 +167,8 @@ export class StreamStatsTail {
 }
 
 export interface OllamaMetricsOptions {
-  getCurrentModel: () => string | null;
+  /** Models Ollama currently has loaded (last /api/ps poll). */
+  getLoadedModels: () => readonly string[];
 }
 
 export class OllamaMetrics {
@@ -178,8 +185,7 @@ export class OllamaMetrics {
 
   private requests: Counter;
   private requestDuration: Histogram;
-  private lockWait: Histogram;
-  private evictions: Counter;
+  private timeToFirstByte: Histogram;
   private upstreamErrors: Counter;
   private tokenUsage: Histogram;
   private tokensPerSecond: Histogram;
@@ -210,24 +216,33 @@ export class OllamaMetrics {
         advice: { explicitBucketBoundaries: SECONDS_BUCKETS },
       },
     );
-    this.lockWait = meter.createHistogram('ollama_proxy.lock.wait.duration', {
-      description: 'Time a model-loading request waited for the swap lock',
-      unit: 's',
-      advice: { explicitBucketBoundaries: SECONDS_BUCKETS },
-    });
-    this.evictions = meter.createCounter('ollama_proxy.evictions', {
-      description: 'Model evictions performed before a swap',
-    });
+    this.timeToFirstByte = meter.createHistogram(
+      'ollama_proxy.time_to_first_byte',
+      {
+        description:
+          'Time from receiving a request to the first upstream response byte (includes prompt prefill)',
+        unit: 's',
+        advice: { explicitBucketBoundaries: SECONDS_BUCKETS },
+      },
+    );
     this.upstreamErrors = meter.createCounter('ollama_proxy.upstream.errors', {
       description: 'Requests where the upstream Ollama was unreachable',
     });
+    // The SDK keeps exporting a series' last value once it has been
+    // observed, so models that were loaded before are reported as 0 rather
+    // than silently left at 1.
+    const seenModels = new Set<string>();
     meter
-      .createObservableGauge('ollama_proxy.loaded_model', {
-        description: 'Model the proxy believes is loaded (1 = loaded)',
+      .createObservableGauge('ollama.loaded_models', {
+        description:
+          'Models loaded in Ollama per /api/ps (1 = loaded, 0 = loaded earlier)',
       })
       .addCallback((result) => {
-        const model = opts.getCurrentModel();
-        if (model) result.observe(1, { model });
+        const loaded = new Set(opts.getLoadedModels());
+        for (const model of loaded) seenModels.add(model);
+        for (const model of seenModels) {
+          result.observe(loaded.has(model) ? 1 : 0, { model });
+        }
       });
 
     this.tokenUsage = meter.createHistogram('gen_ai.client.token.usage', {
@@ -268,12 +283,10 @@ export class OllamaMetrics {
     this.requestDuration.record(durationSeconds, attrs);
   }
 
-  recordLockWait(model: string, seconds: number): void {
-    this.lockWait.record(seconds, { model });
-  }
-
-  recordEviction(fromModel: string, toModel: string): void {
-    this.evictions.add(1, { from_model: fromModel, to_model: toModel });
+  recordTimeToFirstByte(labels: TimeToFirstByteLabels, seconds: number): void {
+    const attrs: Attributes = { path: pathLabel(labels.path) };
+    if (labels.model) attrs.model = labels.model;
+    this.timeToFirstByte.record(seconds, attrs);
   }
 
   recordUpstreamError(path: string): void {

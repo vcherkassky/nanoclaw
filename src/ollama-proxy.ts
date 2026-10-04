@@ -1,53 +1,55 @@
 /**
- * Local HTTP proxy in front of Ollama that enforces a single loaded model.
+ * Local HTTP proxy in front of Ollama: a passive, streaming pass-through
+ * that exists to observe traffic for metrics.
  *
- * Inbound requests are queued through a FIFO async mutex. When a request
- * targets a different model than the currently loaded one, the proxy first
- * fires an eviction (POST /api/generate with keep_alive: 0) for the old
- * model, then forwards the new request. This eliminates the back-to-back
- * model-load race that makes Ollama hang under memory pressure.
+ * Every request (any method, path and query) is forwarded with node:http,
+ * minus hop-by-hop headers, and the upstream response is piped back as it
+ * arrives. The proxy adds no queueing, no model eviction and no timeouts:
+ * Ollama schedules and evicts models itself, and a cold long prompt can
+ * take more than five minutes before Ollama sends its first header byte.
  *
- * Read-only / non-loading endpoints (/api/tags, /api/ps, /api/show,
- * /api/version) bypass the lock entirely. Streaming is preserved by piping
- * the upstream response body directly to the client.
+ * If the client goes away before the response finishes, the upstream
+ * request is destroyed so Ollama cancels the generation.
  *
- * GET /metrics serves OpenTelemetry metrics in Prometheus format
- * (see ollama-metrics.ts).
+ * Metrics come from a passive tap on the response body (token usage and
+ * timings via StreamStatsTail), plus a poll of GET /api/ps for the models
+ * Ollama currently has loaded. GET/HEAD /metrics serves them in Prometheus
+ * format (see ollama-metrics.ts) and is never forwarded.
  */
-import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
+import {
+  Agent,
+  createServer,
+  IncomingHttpHeaders,
+  IncomingMessage,
+  OutgoingHttpHeaders,
+  request as httpRequest,
+  Server,
+  ServerResponse,
+} from 'http';
+import { pipeline, Transform } from 'stream';
 
 import { logger } from './logger.js';
-import {
-  extractInferenceStats,
-  OllamaMetrics,
-  StreamStatsTail,
-} from './ollama-metrics.js';
-
-export interface ProxyRequest {
-  method: string;
-  path: string;
-  body?: Record<string, unknown>;
-}
-
-export interface ProxyResponse {
-  status: number;
-  body?: unknown;
-}
+import { OllamaMetrics, StreamStatsTail } from './ollama-metrics.js';
 
 export interface OllamaProxyOptions {
   realHost: string;
-  fetchFn?: typeof fetch;
+  /** How often to poll upstream /api/ps for loaded models; 0 disables. */
+  loadedModelsPollMs?: number;
 }
 
 const METRICS_PATH = '/metrics';
+const DEFAULT_LOADED_MODELS_POLL_MS = 15_000;
+// Only the poller has a timeout; proxied requests never do
+const LOADED_MODELS_POLL_TIMEOUT_MS = 10_000;
+// Request bodies are buffered (alongside streaming) only to read the
+// `model` field for metric labels; give up on anything larger.
+const MAX_MODEL_PEEK_BYTES = 32 * 1024 * 1024;
 
-function secondsSince(start: number): number {
-  return (performance.now() - start) / 1000;
-}
-
-const MODEL_LOADING_PATHS = new Set([
+// Responses on these paths carry token counts / timings worth tapping
+const INFERENCE_PATHS = new Set([
   '/api/chat',
   '/api/generate',
+  '/api/embed',
   '/api/embeddings',
   '/v1/chat/completions',
   '/v1/completions',
@@ -55,381 +57,321 @@ const MODEL_LOADING_PATHS = new Set([
   '/v1/messages',
 ]);
 
-class AsyncMutex {
-  private chain: Promise<unknown> = Promise.resolve();
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
 
-  runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.chain.then(() => fn());
-    // Swallow errors on the chain so a thrown task doesn't deadlock future ones
-    this.chain = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    return next;
+function secondsSince(start: number): number {
+  return (performance.now() - start) / 1000;
+}
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Copy headers minus hop-by-hop ones, including any named in Connection. */
+function endToEndHeaders(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
+  const named = new Set(
+    String(headers.connection ?? '')
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const out: OutgoingHttpHeaders = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    if (HOP_BY_HOP_HEADERS.has(name) || named.has(name)) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+function modelFromBody(chunks: Buffer[]): string | undefined {
+  if (chunks.length === 0) return undefined;
+  try {
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+      model?: unknown;
+    };
+    return typeof body?.model === 'string' ? body.model : undefined;
+  } catch {
+    return undefined;
   }
 }
 
 export class OllamaProxy {
-  private realHost: string;
-  private fetchFn: typeof fetch;
-  private currentModel: string | null = null;
-  private evictionCount = 0;
+  private upstream: URL;
+  // No keep-alive: a fresh localhost connection costs nothing next to an
+  // inference request, and it rules out reusing a socket Ollama just closed
+  private agent = new Agent({ keepAlive: false });
+  private loadedModelsPollMs: number;
+  private loadedModels: string[] = [];
+  private pollTimer: NodeJS.Timeout | null = null;
+  private poll: Promise<void> | null = null;
   private requestCount = 0;
-  private lastEvictionAt: string | null = null;
-  private mutex = new AsyncMutex();
   private server: Server | null = null;
   readonly metrics: OllamaMetrics;
 
   constructor(opts: OllamaProxyOptions) {
-    this.realHost = opts.realHost.replace(/\/$/, '');
-    this.fetchFn = opts.fetchFn ?? fetch;
+    this.upstream = new URL(opts.realHost);
+    if (this.upstream.protocol !== 'http:') {
+      throw new Error(
+        `OllamaProxy: only http:// upstreams are supported (got ${opts.realHost})`,
+      );
+    }
+    this.loadedModelsPollMs =
+      opts.loadedModelsPollMs ?? DEFAULT_LOADED_MODELS_POLL_MS;
     this.metrics = new OllamaMetrics({
-      getCurrentModel: () => this.currentModel,
+      getLoadedModels: () => this.loadedModels,
     });
   }
 
-  getCurrentModel(): string | null {
-    return this.currentModel;
-  }
-
-  getStats(): {
-    currentModel: string | null;
-    evictions: number;
-    requests: number;
-    lastEvictionAt: string | null;
-  } {
+  getStats(): { loadedModels: string[]; requests: number } {
     return {
-      currentModel: this.currentModel,
-      evictions: this.evictionCount,
+      loadedModels: [...this.loadedModels],
       requests: this.requestCount,
-      lastEvictionAt: this.lastEvictionAt,
     };
   }
 
-  /**
-   * Reconcile in-memory state with the upstream's actual loaded models.
-   * Call once at startup so a NanoClaw restart doesn't incorrectly think
-   * "no model is loaded" when Ollama still has one warm.
-   */
-  async syncCurrentModel(): Promise<void> {
-    try {
-      const res = await this.fetchFn(`${this.realHost}/api/ps`, {
-        method: 'GET',
-      });
-      if (!res.ok) return;
-      const data = (await res.json()) as { models?: Array<{ name: string }> };
-      const loaded = data.models?.[0]?.name ?? null;
-      this.currentModel = loaded;
-      if (loaded) {
-        logger.info({ model: loaded }, 'OllamaProxy: synced existing model');
-      }
-    } catch (err) {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'OllamaProxy: /api/ps sync failed (continuing with null)',
-      );
-    }
-  }
-
-  async handle(req: ProxyRequest): Promise<ProxyResponse> {
-    this.requestCount++;
-    const start = performance.now();
-    const model = req.body?.model as string | undefined;
-    const response = await this.handleInner(req, start);
-    this.metrics.recordRequest(
-      { path: req.path, model, status: response.status },
-      secondsSince(start),
-    );
-    return response;
-  }
-
-  private async handleInner(
-    req: ProxyRequest,
-    start: number,
-  ): Promise<ProxyResponse> {
-    if (!MODEL_LOADING_PATHS.has(req.path)) {
-      return this.forward(req);
-    }
-
-    const requested = (req.body?.model as string | undefined) ?? null;
-    if (!requested) {
-      return { status: 400, body: { error: 'missing model field' } };
-    }
-
-    return this.mutex.runExclusive(async () => {
-      this.metrics.recordLockWait(requested, secondsSince(start));
-      if (this.currentModel && this.currentModel !== requested) {
-        await this.evict(this.currentModel, requested);
-      }
-
-      const response = await this.forward(req);
-      const stats = extractInferenceStats(response.body);
-      if (stats) this.metrics.recordInference(requested, stats);
-
-      // Update state based on outcome
-      if (response.status === 502) {
-        // Upstream broke — we don't actually know what's loaded; safer null
-        this.currentModel = null;
-      } else if (req.body?.keep_alive === 0 && req.path === '/api/generate') {
-        // User-initiated unload
-        this.currentModel = null;
-      } else {
-        // Optimistic: assume the model was loaded even on non-2xx, since
-        // Ollama may have loaded it before erroring on the request itself.
-        this.currentModel = requested;
-      }
-
-      return response;
-    });
-  }
-
-  private async evict(model: string, nextModel: string): Promise<void> {
-    this.evictionCount++;
-    this.metrics.recordEviction(model, nextModel);
-    this.lastEvictionAt = new Date().toISOString();
-    logger.info({ model }, 'OllamaProxy: evicting model before swap');
-    try {
-      await this.fetchFn(`${this.realHost}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, keep_alive: 0 }),
-      });
-    } catch (err) {
-      logger.warn(
-        { model, err: err instanceof Error ? err.message : String(err) },
-        'OllamaProxy: eviction request failed (continuing)',
-      );
-    }
-    this.currentModel = null;
-  }
-
-  private async forward(req: ProxyRequest): Promise<ProxyResponse> {
-    const url = `${this.realHost}${req.path}`;
-    try {
-      const init: RequestInit = { method: req.method };
-      if (req.body !== undefined) {
-        init.body = JSON.stringify(req.body);
-        init.headers = { 'Content-Type': 'application/json' };
-      }
-      const res = await this.fetchFn(url, init);
-      const body = await res.json().catch(() => undefined);
-      return { status: res.status, body };
-    } catch (err) {
-      logger.warn(
-        {
-          path: req.path,
-          err: err instanceof Error ? err.message : String(err),
-        },
-        'OllamaProxy: upstream fetch failed',
-      );
-      this.metrics.recordUpstreamError(req.path);
-      return { status: 502, body: { error: 'upstream unreachable' } };
-    }
-  }
-
-  /**
-   * Boot an HTTP listener that adapts incoming requests into handle() calls.
-   * Streaming responses (Ollama's NDJSON or SSE) are piped through verbatim.
-   */
   async listen(port: number): Promise<void> {
     if (this.server) throw new Error('OllamaProxy already listening');
 
-    this.server = createServer((req, res) =>
-      this.httpHandler(req, res).catch((err) => {
-        logger.error(
-          { err: err instanceof Error ? err.message : String(err) },
-          'OllamaProxy: unhandled error in HTTP handler',
-        );
-        if (!res.headersSent) {
-          res.statusCode = 500;
-          res.end(JSON.stringify({ error: 'proxy internal error' }));
-        }
-      }),
-    );
+    const server = createServer((req, res) => this.handleRequest(req, res));
+    // Node's default 300 s requestTimeout must not apply to a proxy
+    server.requestTimeout = 0;
+    this.server = server;
 
     await new Promise<void>((resolve, reject) => {
-      this.server!.once('error', reject);
-      this.server!.listen(port, '127.0.0.1', () => {
-        this.server!.off('error', reject);
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', () => {
+        server.off('error', reject);
         logger.info({ port }, 'OllamaProxy listening');
         resolve();
       });
     });
+
+    if (this.loadedModelsPollMs > 0) {
+      void this.refreshLoadedModels();
+      this.pollTimer = setInterval(
+        () => void this.refreshLoadedModels(),
+        this.loadedModelsPollMs,
+      );
+      this.pollTimer.unref();
+    }
   }
 
   async close(): Promise<void> {
-    if (!this.server) return;
-    await new Promise<void>((resolve) => this.server!.close(() => resolve()));
-    this.server = null;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    // Let an in-flight poll settle (bounded by its own timeout)
+    await this.poll;
+    const server = this.server;
+    if (server) {
+      this.server = null;
+      const closed = new Promise<void>((resolve) =>
+        server.close(() => resolve()),
+      );
+      // Don't let a long in-flight generation hold up shutdown
+      server.closeAllConnections();
+      await closed;
+    }
+    this.agent.destroy();
   }
 
-  private async httpHandler(
-    req: IncomingMessage,
-    res: ServerResponse,
-  ): Promise<void> {
+  /**
+   * Poll upstream GET /api/ps and remember which models are loaded. On any
+   * failure the last known value is kept. Concurrent calls share one poll.
+   */
+  refreshLoadedModels(): Promise<void> {
+    this.poll ??= this.pollLoadedModels().finally(() => {
+      this.poll = null;
+    });
+    return this.poll;
+  }
+
+  private async pollLoadedModels(): Promise<void> {
+    try {
+      const body = await new Promise<string>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            hostname: this.upstream.hostname,
+            port: this.upstream.port || 80,
+            method: 'GET',
+            path: '/api/ps',
+            agent: this.agent,
+          },
+          (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (c: Buffer) => chunks.push(c));
+            res.on('error', reject);
+            res.on('end', () => {
+              if (res.statusCode !== 200) {
+                reject(new Error(`/api/ps returned ${res.statusCode}`));
+              } else {
+                resolve(Buffer.concat(chunks).toString('utf8'));
+              }
+            });
+          },
+        );
+        req.setTimeout(LOADED_MODELS_POLL_TIMEOUT_MS, () =>
+          req.destroy(new Error('/api/ps timed out')),
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      const data = JSON.parse(body) as {
+        models?: Array<{ name?: unknown; model?: unknown }>;
+      };
+      this.loadedModels = (data.models ?? [])
+        .map((m) => m.name ?? m.model)
+        .filter((m): m is string => typeof m === 'string');
+    } catch (err) {
+      logger.debug(
+        { err: errMessage(err) },
+        'OllamaProxy: /api/ps poll failed (keeping last value)',
+      );
+    }
+  }
+
+  private handleRequest(req: IncomingMessage, res: ServerResponse): void {
+    const start = performance.now();
     const method = req.method ?? 'GET';
-    const path = (req.url ?? '/').split('?')[0];
+    const url = req.url ?? '/';
+    const path = url.split('?')[0];
 
     if ((method === 'GET' || method === 'HEAD') && path === METRICS_PATH) {
       this.metrics.handleScrape(req, res);
       return;
     }
 
-    // For model-loading paths we need to peek at the JSON body to read the
-    // model field. For passthrough paths we could stream-forward, but
-    // buffering is fine — Ollama request bodies are small.
-    const body = await this.readJsonBody(req);
+    this.requestCount++;
 
-    if (MODEL_LOADING_PATHS.has(path) || method === 'GET') {
-      // For pass-through GETs we can use handle() (the upstream returns JSON
-      // for /api/tags, /api/ps, /api/show, /api/version — all small bodies).
-      if (!MODEL_LOADING_PATHS.has(path)) {
-        const result = await this.handle({ method, path, body });
-        res.statusCode = result.status;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify(result.body ?? null));
-        return;
-      }
+    let model: string | undefined;
+    let status = 502;
+    let tail: StreamStatsTail | null = null;
+    let clientGone = false;
+    let upstreamFailed = false;
+    let recorded = false;
 
-      // For model-loading paths we stream upstream straight back so SSE
-      // (stream: true) flows token-by-token. We still acquire the lock
-      // around model swap.
-      this.requestCount++;
-      const start = performance.now();
-      const requested = body?.model as string | undefined;
-
-      // If the client goes away (e.g. a killed container), cancel the
-      // upstream generation so it doesn't keep holding the lock.
-      const upstreamAbort = new AbortController();
-      const onClientClose = () => {
-        if (!res.writableFinished) upstreamAbort.abort();
-      };
-      res.on('close', onClientClose);
-
-      await this.mutex.runExclusive(async () => {
-        if (upstreamAbort.signal.aborted) return; // gave up while queued
-        if (!requested) {
-          res.statusCode = 400;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ error: 'missing model field' }));
-          return;
-        }
-
-        this.metrics.recordLockWait(requested, secondsSince(start));
-        if (this.currentModel && this.currentModel !== requested) {
-          await this.evict(this.currentModel, requested);
-        }
-
-        try {
-          const upstream = await this.fetchFn(`${this.realHost}${path}`, {
-            method,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: upstreamAbort.signal,
-          });
-
-          res.statusCode = upstream.status;
-          upstream.headers.forEach((v, k) => {
-            // Skip hop-by-hop and length headers since we stream
-            if (
-              k === 'transfer-encoding' ||
-              k === 'connection' ||
-              k === 'content-length'
-            ) {
-              return;
-            }
-            res.setHeader(k, v);
-          });
-
-          if (upstream.body) {
-            const reader = upstream.body.getReader();
-            const tail = new StreamStatsTail();
-            try {
-              for (;;) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                if (value) {
-                  res.write(Buffer.from(value));
-                  tail.push(value);
-                }
-              }
-            } finally {
-              reader.releaseLock();
-            }
-            const stats = tail.finish();
-            if (stats) this.metrics.recordInference(requested, stats);
-          }
-          res.end();
-
-          if (body?.keep_alive === 0 && path === '/api/generate') {
-            this.currentModel = null;
-          } else if (upstream.status !== 502) {
-            this.currentModel = requested;
-          } else {
-            this.currentModel = null;
-          }
-        } catch (err) {
-          if (upstreamAbort.signal.aborted) {
-            // Client disconnected: not an upstream failure, and the model
-            // stays loaded.
-            logger.info(
-              { path, model: requested },
-              'OllamaProxy: client disconnected, upstream request cancelled',
-            );
-            this.currentModel = requested;
-            return;
-          }
-          logger.warn(
-            {
-              path,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            'OllamaProxy: streaming forward failed',
-          );
-          this.metrics.recordUpstreamError(path);
-          if (!res.headersSent) {
-            res.statusCode = 502;
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: 'upstream unreachable' }));
-          } else {
-            res.end();
-          }
-          this.currentModel = null;
-        }
-      });
-      res.off('close', onClientClose);
+    const record = (finalStatus: number) => {
+      if (recorded) return;
+      recorded = true;
       this.metrics.recordRequest(
-        {
-          path,
-          model: requested,
-          // 499 = client closed request (nginx convention)
-          status: upstreamAbort.signal.aborted ? 499 : res.statusCode,
-        },
+        { path, model, status: finalStatus },
         secondsSince(start),
       );
-      return;
+      const stats = tail?.finish();
+      if (stats && finalStatus >= 200 && finalStatus < 300) {
+        this.metrics.recordInference(model ?? 'unknown', stats);
+      }
+    };
+
+    const headers = endToEndHeaders(req.headers);
+    headers.host = this.upstream.host;
+    // Transfer-Encoding is hop-by-hop, but a chunked inbound body is still
+    // streamed without a length; node:http only chunks POST/PUT/PATCH by
+    // default, so ask for chunked framing explicitly.
+    if (req.headers['transfer-encoding'] && !req.headers['content-length']) {
+      headers['transfer-encoding'] = 'chunked';
     }
 
-    // Other methods: pure pass-through
-    const result = await this.handle({ method, path, body });
-    res.statusCode = result.status;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(result.body ?? null));
-  }
+    const upstreamReq = httpRequest({
+      hostname: this.upstream.hostname,
+      port: this.upstream.port || 80,
+      method,
+      path: url,
+      headers,
+      agent: this.agent,
+    });
 
-  private async readJsonBody(
-    req: IncomingMessage,
-  ): Promise<Record<string, unknown> | undefined> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    if (chunks.length === 0) return undefined;
-    const text = Buffer.concat(chunks).toString('utf8');
-    try {
-      return JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return undefined;
-    }
+    const onUpstreamError = (err: unknown) => {
+      if (clientGone || upstreamFailed) return;
+      upstreamFailed = true;
+      this.metrics.recordUpstreamError(path);
+      logger.warn(
+        { path, model, err: errMessage(err) },
+        'OllamaProxy: upstream request failed',
+      );
+      if (!res.headersSent) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'upstream unreachable' }));
+      } else {
+        res.destroy();
+      }
+      record(502);
+    };
+
+    // Client went away before the response finished (killed container,
+    // classifier timeout): cancel upstream so Ollama stops the work.
+    res.on('close', () => {
+      if (res.writableFinished || upstreamFailed) return;
+      clientGone = true;
+      upstreamReq.destroy();
+      logger.info(
+        { path, model },
+        'OllamaProxy: client disconnected, upstream request cancelled',
+      );
+      // 499 = client closed request (nginx convention)
+      record(499);
+    });
+
+    upstreamReq.on('error', onUpstreamError);
+
+    upstreamReq.on('response', (upstreamRes) => {
+      this.metrics.recordTimeToFirstByte({ path, model }, secondsSince(start));
+      status = upstreamRes.statusCode ?? 502;
+      if (clientGone) {
+        upstreamRes.destroy();
+        return;
+      }
+      upstreamRes.on('error', onUpstreamError);
+      upstreamRes.on('aborted', () =>
+        onUpstreamError(new Error('upstream response aborted')),
+      );
+
+      if (status >= 200 && status < 300 && INFERENCE_PATHS.has(path)) {
+        tail = new StreamStatsTail();
+      }
+      const statsTap = new Transform({
+        transform(chunk: Buffer, _enc, cb) {
+          tail?.push(chunk);
+          cb(null, chunk);
+        },
+      });
+
+      res.writeHead(status, endToEndHeaders(upstreamRes.headers));
+      pipeline(upstreamRes, statsTap, res, (err) => {
+        if (!err) record(status);
+        else onUpstreamError(err);
+      });
+    });
+
+    // Stream the body upstream unchanged, keeping a copy to read `model`.
+    // Not pipeline(): an upstream error must not destroy the client socket
+    // before the 502 is written. A client abort is handled by res 'close'.
+    const bodyCopy: Buffer[] = [];
+    let copied = 0;
+    const modelPeek = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        copied += chunk.length;
+        if (copied <= MAX_MODEL_PEEK_BYTES) bodyCopy.push(chunk);
+        cb(null, chunk);
+      },
+      flush(cb) {
+        if (copied <= MAX_MODEL_PEEK_BYTES) model = modelFromBody(bodyCopy);
+        bodyCopy.length = 0;
+        cb();
+      },
+    });
+    req.pipe(modelPeek).pipe(upstreamReq);
   }
 }

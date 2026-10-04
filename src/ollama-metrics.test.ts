@@ -124,10 +124,9 @@ describe('StreamStatsTail', () => {
 
 describe('OllamaMetrics', () => {
   it('renders recorded metrics in Prometheus text format', async () => {
-    const m = new OllamaMetrics({ getCurrentModel: () => 'gemma4:26b' });
+    const m = new OllamaMetrics({ getLoadedModels: () => ['gemma4:26b'] });
     m.recordRequest({ path: '/api/chat', model: 'gemma4:26b', status: 200 }, 2);
-    m.recordLockWait('gemma4:26b', 0.5);
-    m.recordEviction('old', 'gemma4:26b');
+    m.recordTimeToFirstByte({ path: '/v1/messages', model: 'gemma4:26b' }, 42);
     m.recordUpstreamError('/api/chat');
     m.recordInference('gemma4:26b', {
       inputTokens: 100,
@@ -143,12 +142,11 @@ describe('OllamaMetrics', () => {
       /ollama_proxy_requests_total\{[^}]*path="\/api\/chat"[^}]*\} 1/,
     );
     expect(text).toContain('ollama_proxy_request_duration_count');
-    expect(text).toContain('ollama_proxy_lock_wait_duration_sum');
     expect(text).toMatch(
-      /ollama_proxy_evictions_total\{from_model="old",to_model="gemma4:26b"\} 1/,
+      /ollama_proxy_time_to_first_byte_sum\{path="\/v1\/messages",model="gemma4:26b"\} 42/,
     );
     expect(text).toMatch(/ollama_proxy_upstream_errors_total\{[^}]*\} 1/);
-    expect(text).toMatch(/ollama_proxy_loaded_model\{model="gemma4:26b"\} 1/);
+    expect(text).toMatch(/ollama_loaded_models\{model="gemma4:26b"\} 1/);
     expect(text).toMatch(
       /gen_ai_client_token_usage_sum\{[^}]*gen_ai_token_type="input"[^}]*\} 100/,
     );
@@ -162,13 +160,44 @@ describe('OllamaMetrics', () => {
     await m.shutdown();
   });
 
+  it('no longer exposes lock-wait, eviction or single-model series', async () => {
+    const m = new OllamaMetrics({ getLoadedModels: () => ['a'] });
+    m.recordRequest({ path: '/api/chat', model: 'a', status: 200 }, 1);
+    const text = await m.scrape();
+    expect(text).not.toContain('lock_wait');
+    expect(text).not.toContain('evictions');
+    expect(text).not.toContain('ollama_proxy_loaded_model');
+    await m.shutdown();
+  });
+
+  it('has duration buckets beyond 300 s for long turns', async () => {
+    const m = new OllamaMetrics({ getLoadedModels: () => [] });
+    m.recordRequest({ path: '/api/chat', status: 200 }, 900);
+    m.recordTimeToFirstByte({ path: '/api/chat' }, 900);
+    const text = await m.scrape();
+    expect(text).toMatch(
+      /ollama_proxy_request_duration_bucket\{[^}]*le="600"\} 0/,
+    );
+    expect(text).toMatch(
+      /ollama_proxy_request_duration_bucket\{[^}]*le="1200"\} 1/,
+    );
+    expect(text).toMatch(
+      /ollama_proxy_time_to_first_byte_bucket\{path="\/api\/chat",le="1200"\} 1/,
+    );
+    await m.shutdown();
+  });
+
   it('labels unknown paths as "other"', async () => {
-    const m = new OllamaMetrics({ getCurrentModel: () => null });
+    const m = new OllamaMetrics({ getLoadedModels: () => [] });
     m.recordRequest({ path: '/random/junk/123', status: 404 }, 0.01);
+    m.recordTimeToFirstByte({ path: '/random/junk/123' }, 0.01);
     m.recordUpstreamError('/nope');
     const text = await m.scrape();
     expect(text).toMatch(
       /ollama_proxy_requests_total\{path="other",status="404"\} 1/,
+    );
+    expect(text).toMatch(
+      /ollama_proxy_time_to_first_byte_count\{path="other"\} 1/,
     );
     expect(text).toMatch(
       /ollama_proxy_upstream_errors_total\{path="other"\} 1/,
@@ -177,14 +206,27 @@ describe('OllamaMetrics', () => {
     await m.shutdown();
   });
 
-  it('omits the loaded-model series when nothing is loaded', async () => {
-    const m = new OllamaMetrics({ getCurrentModel: () => null });
-    expect(await m.scrape()).not.toMatch(/ollama_proxy_loaded_model\{/);
+  it('emits one loaded-models series per model, none when nothing was ever loaded', async () => {
+    const m = new OllamaMetrics({ getLoadedModels: () => [] });
+    expect(await m.scrape()).not.toMatch(/ollama_loaded_models\{/);
+    await m.shutdown();
+  });
+
+  it('drops unloaded models to 0 instead of leaving them at 1', async () => {
+    let loaded: string[] = ['a:1b', 'b:2b'];
+    const m = new OllamaMetrics({ getLoadedModels: () => loaded });
+    let text = await m.scrape();
+    expect(text).toMatch(/ollama_loaded_models\{model="a:1b"\} 1/);
+    expect(text).toMatch(/ollama_loaded_models\{model="b:2b"\} 1/);
+    loaded = ['b:2b'];
+    text = await m.scrape();
+    expect(text).toMatch(/ollama_loaded_models\{model="a:1b"\} 0/);
+    expect(text).toMatch(/ollama_loaded_models\{model="b:2b"\} 1/);
     await m.shutdown();
   });
 
   it('skips tokens/sec when eval duration is zero or missing', async () => {
-    const m = new OllamaMetrics({ getCurrentModel: () => null });
+    const m = new OllamaMetrics({ getLoadedModels: () => [] });
     m.recordInference('x', { inputTokens: 1, outputTokens: 1 });
     m.recordInference('x', { inputTokens: 1, outputTokens: 1, evalSeconds: 0 });
     expect(await m.scrape()).not.toMatch(/ollama_eval_tokens_per_second_count/);

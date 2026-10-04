@@ -3,8 +3,8 @@ import { readEnvFile } from './env.js';
 /**
  * Cheap liveness probe for the local model backend.
  *
- * Hits the read-only `/api/tags` endpoint (bypasses the OllamaProxy model
- * lock, returns 502 when the upstream is down). Used as a pre-flight before
+ * Hits the read-only `/api/tags` endpoint (cheap, loads no model; the
+ * OllamaProxy returns 502 when the upstream is down). Used as a pre-flight before
  * spawning an agent container: if the backend is unreachable — e.g. the laptop
  * is asleep / lid closed — spawning would just hang for the full container
  * timeout producing no output, so callers should defer instead.

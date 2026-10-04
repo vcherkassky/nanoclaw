@@ -802,11 +802,10 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
-  // Start Ollama proxy (host + containers route Ollama traffic through this
-  // to ensure only one model is loaded at a time).
+  // Start Ollama proxy (host + containers route Ollama traffic through this;
+  // a passive streaming pass-through that records metrics).
   const ollamaProxy = new OllamaProxy({ realHost: OLLAMA_REAL_HOST });
   await ollamaProxy.listen(OLLAMA_PROXY_PORT);
-  await ollamaProxy.syncCurrentModel();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
