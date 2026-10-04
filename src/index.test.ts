@@ -38,6 +38,7 @@ vi.mock('./db.js', () => ({
   getAllSessions: vi.fn(() => ({})),
   getAllRegisteredGroups: vi.fn(() => ({})),
   getAllTasks: vi.fn(() => []),
+  getMaxMessageSeq: vi.fn(() => 0),
   getAllChats: vi.fn(() => []),
   getMessagesSince: vi.fn(),
   getNewMessages: vi.fn(() => ({ messages: [], newTimestamp: '' })),
@@ -596,24 +597,65 @@ describe('processGroupMessages — session lifecycle', () => {
       expect(enqueue).not.toHaveBeenCalled();
     });
 
-    it('does not re-run a command right after telling the user to try again', async () => {
+    it('a failing earlier message never blocks /clear (the escape hatch)', async () => {
       const enqueue = vi
         .spyOn(GroupQueue.prototype, 'enqueueMessageCheck')
         .mockImplementation(() => {});
+      writeSession('cur-sess');
+      await turnWithSession('cur-sess');
+      channel.sendMessage.mockClear();
+      vi.mocked(runContainerAgent).mockReset();
+      vi.mocked(runContainerAgent).mockResolvedValue({
+        status: 'error',
+        result: null,
+        error: 'model down',
+      });
+      say('@Claw hi');
+      say('/clear');
+
+      const ok = await _processGroupMessages(GROUP_JID);
+
+      expect(ok).toBe(true);
+      expect(runContainerAgent).toHaveBeenCalledOnce();
+      expect(deleteSession).toHaveBeenCalledOnce();
+      expect(sent()).toEqual([
+        "Your earlier message couldn't be processed and was dropped — please resend it after the clear.",
+        '🧹 Session cleared. Your next message starts a fresh conversation (long-term memory in CLAUDE.md is kept).',
+      ]);
+      expect(enqueue).not.toHaveBeenCalled();
+
+      // Nothing is left pending: another pass does no work.
+      expect(await _processGroupMessages(GROUP_JID)).toBe(true);
+      expect(runContainerAgent).toHaveBeenCalledOnce();
+      expect(deleteSession).toHaveBeenCalledOnce();
+    });
+
+    it('a /compact skipped after a failed earlier message never runs later', async () => {
       say('@Claw question');
-      say('/context');
+      say('/compact');
       vi.mocked(runContainerAgent).mockImplementationOnce(
         async (_g, _i, _r, onOutput) => {
           await onOutput?.({ status: 'success', result: 'partial answer' });
           return { status: 'error', result: null, error: 'crash' };
         },
       );
+      await _processGroupMessages(GROUP_JID);
+      expect(sent().at(-1)).toContain('/compact was not run');
 
+      say('@Claw thanks');
+      const prompts: string[] = [];
+      vi.mocked(runContainerAgent).mockImplementationOnce(async (_g, input) => {
+        prompts.push(input.prompt);
+        return { status: 'success', result: null };
+      });
       await _processGroupMessages(GROUP_JID);
 
-      expect(sent()).toContain('partial answer');
-      expect(sent().some((t: string) => t.includes('Try again'))).toBe(true);
-      expect(enqueue).not.toHaveBeenCalled();
+      expect(prompts).toEqual(['formatted messages']);
+      expect(
+        vi
+          .mocked(runContainerAgent)
+          .mock.calls.some(([, input]) => input.prompt === '/compact'),
+      ).toBe(false);
     });
 
     it('answers a question sent just before /clear, then clears', async () => {

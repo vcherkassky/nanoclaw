@@ -675,6 +675,14 @@ export function setSession(groupFolder: string, sessionId: string): void {
   ).run(groupFolder, sessionId);
 }
 
+/** Highest message rowid (the seq in message cursors), or 0 when empty. */
+export function getMaxMessageSeq(): number {
+  const row = db.prepare('SELECT MAX(rowid) AS max FROM messages').get() as {
+    max: number | null;
+  };
+  return row.max ?? 0;
+}
+
 export function deleteSession(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }

@@ -116,14 +116,12 @@ export type SessionCommandResult =
   | { handled: false }
   | {
       handled: true;
-      /** false: nothing was consumed; the caller should retry later. */
-      success: boolean;
       /**
-       * The command itself was NOT run and is still pending (messages before
-       * it were consumed, and the user was asked to try again). The caller
-       * must not immediately re-run it.
+       * Always true today: a handled command is executed or explicitly
+       * consumed in the same pass, and the cursor ends past it. Kept as a
+       * boolean for the caller's retry contract.
        */
-      commandPending?: true;
+      success: boolean;
     };
 
 function compactionFailureMessage(reason: string): string {
@@ -140,7 +138,9 @@ function resultToText(result: string | object | null | undefined): string {
  * Handle session command interception in processGroupMessages.
  * Scans messages for a session command, handles auth + execution.
  * Returns { handled: true, success } if a command was found; { handled: false } otherwise.
- * success=false means the caller should retry (cursor was not advanced).
+ * A found command is never blocked or deferred: it is executed (or, for
+ * /compact after a failed earlier message, explicitly consumed) in this pass,
+ * and the cursor always ends past it.
  */
 export async function handleSessionCommand(opts: {
   missedMessages: NewMessage[];
@@ -213,20 +213,32 @@ export async function handleSessionCommand(opts: {
     });
 
     if (preResult === 'error' || hadPreError) {
+      // Session commands are never blocked and never deferred: a failing
+      // earlier message must not hold /clear (the escape hatch) hostage, and
+      // a command must not run later behind the user's back. Either way the
+      // earlier messages are consumed here, and so is the command.
       logger.warn(
-        { group: groupName, command },
-        'Pre-command processing failed, aborting session command',
+        { group: groupName, command, preOutputSent },
+        'Messages before session command failed; consuming them',
       );
-      await deps.sendMessage(
-        `Failed to process messages before ${command}. Try again.`,
-      );
-      if (preOutputSent) {
-        // Output was already sent — don't retry or it will duplicate.
-        // Advance cursor past pre-command messages, leave command pending.
-        deps.advanceCursor(messageCursor(preCmdMsgs[preCmdMsgs.length - 1]));
-        return { handled: true, success: true, commandPending: true };
+      if (!isHostHandled) {
+        // /compact: don't compact a session whose last turn just failed.
+        deps.advanceCursor(messageCursor(cmdMsg));
+        await deps.sendMessage(
+          preOutputSent
+            ? `⚠️ ${command} was not run because the earlier message failed — send ${command} again.`
+            : `⚠️ Your earlier message couldn't be processed and was dropped, so ${command} was not run — please resend it, then send ${command} again.`,
+        );
+        return { handled: true, success: true };
       }
-      return { handled: true, success: false };
+      if (!preOutputSent) {
+        await deps.sendMessage(
+          command === '/clear'
+            ? "Your earlier message couldn't be processed and was dropped — please resend it after the clear."
+            : "Your earlier message couldn't be processed and was dropped — please resend it.",
+        );
+      }
+      // Fall through: run the host-handled command in this same pass.
     }
   }
 

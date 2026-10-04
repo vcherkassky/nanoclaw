@@ -15,6 +15,7 @@ import {
   getAllSessions,
   getEmailAttempt,
   getLastAgentRun,
+  getMaxMessageSeq,
   getMessagesSince,
   getNewMessages,
   getRecentMessages,
@@ -930,6 +931,29 @@ describe('same-second messages (Telegram has 1 s timestamps)', () => {
 
     expect(getMessagesSince(JID, cursor, 'Bot')).toEqual([]);
     expect(getNewMessages([JID], cursor, 'Bot').messages).toEqual([]);
+  });
+
+  it('when the LIMIT cuts through a same-second group, keeps the newest rows in order', () => {
+    put('1', 'a');
+    put('2', 'b');
+    put('3', 'c');
+    put('4', 'd');
+    // Only the 2 most recent are returned; rowid DESC decides which.
+    expect(getMessagesSince(JID, '', 'Bot', 2).map((m) => m.content)).toEqual([
+      'c',
+      'd',
+    ]);
+    const polled = getNewMessages([JID], '', 'Bot', 2);
+    expect(polled.messages.map((m) => m.content)).toEqual(['c', 'd']);
+    expect(polled.newTimestamp).toBe(messageCursor(polled.messages[1]));
+  });
+
+  it('getMaxMessageSeq returns the highest rowid (0 when empty)', () => {
+    expect(getMaxMessageSeq()).toBe(0);
+    put('1', 'a');
+    put('2', 'b');
+    const [, b] = getMessagesSince(JID, '', 'Bot');
+    expect(getMaxMessageSeq()).toBe(b.seq);
   });
 
   it('a legacy timestamp-only cursor behaves exactly as before', () => {

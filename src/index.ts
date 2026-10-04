@@ -60,6 +60,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getMaxMessageSeq,
   getMessagesSince,
   getNewMessages,
   getRegisteredGroup,
@@ -72,7 +73,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { messageCursor } from './message-cursor.js';
+import { messageCursor, sanitizeStoredCursor } from './message-cursor.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
@@ -122,6 +123,12 @@ function loadState(): void {
   } catch {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
+  }
+  // Guard against cursors pointing past the DB (e.g. restored from a backup).
+  const maxSeq = getMaxMessageSeq();
+  lastTimestamp = sanitizeStoredCursor(lastTimestamp, maxSeq);
+  for (const [jid, cursor] of Object.entries(lastAgentTimestamp)) {
+    lastAgentTimestamp[jid] = sanitizeStoredCursor(cursor, maxSeq);
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
@@ -346,16 +353,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     },
   });
   if (cmdResult.handled) {
-    // A command only consumes messages up to itself. Anything queued behind it
-    // (e.g. "/status" then "/context" sent together) would otherwise sit in
-    // the DB until some unrelated message arrives. The cursor strictly
-    // advanced, so re-enqueueing always makes progress; while this run is
-    // active the queue just marks it pending and drains it right after.
-    // Not when the command itself is still pending after a failed pre-step:
-    // the user was just told to try again, so don't run it behind their back.
+    // A command only consumes messages up to itself (the cursor always ends
+    // past the command). Anything queued genuinely AFTER it (e.g. "/status"
+    // then "/context" sent together) would otherwise sit in the DB until some
+    // unrelated message arrives. The cursor strictly advanced, so
+    // re-enqueueing always makes progress; while this run is active the queue
+    // just marks it pending and drains it right after.
     if (
       cmdResult.success &&
-      !cmdResult.commandPending &&
       getMessagesSince(
         chatJid,
         lastAgentTimestamp[chatJid] || '',

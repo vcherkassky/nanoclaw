@@ -610,7 +610,7 @@ describe('handleSessionCommand', () => {
     );
   });
 
-  it('returns success:false on pre-compact failure with no output', async () => {
+  it('consumes /compact and says so on pre-compact failure with no output', async () => {
     const deps = makeDeps({ runAgent: vi.fn().mockResolvedValue('error') });
     const msgs = [
       makeMsg('summarize this', { timestamp: '99' }),
@@ -624,9 +624,11 @@ describe('handleSessionCommand', () => {
       timezone: 'UTC',
       deps,
     });
-    expect(result).toEqual({ handled: true, success: false });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.advanceCursor).toHaveBeenLastCalledWith('100');
+    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
     expect(deps.sendMessage).toHaveBeenCalledWith(
-      expect.stringContaining('Failed to process'),
+      expect.stringContaining('/compact was not run'),
     );
   });
 });
@@ -709,48 +711,122 @@ describe('handleSessionCommand: messages before the command', () => {
     expect(clearSession).toHaveBeenCalledOnce();
   });
 
-  it('does not run the host command when answering earlier messages fails', async () => {
-    const clearSession = vi.fn();
-    const deps = makeDeps({
-      clearSession,
-      runAgent: vi.fn().mockResolvedValue('error'),
+  // Session commands are never blocked and never deferred: whatever happens
+  // to the earlier messages, the command is executed or explicitly consumed
+  // in the same pass and the cursor ends past it.
+  const failsSilently = () => vi.fn().mockResolvedValue('error');
+  const failsAfterOutput = () =>
+    vi.fn().mockImplementation(async (_p, onOutput) => {
+      await onOutput({ status: 'success', result: 'partial answer' });
+      return 'error';
     });
-    const result = await run(
-      [
-        makeMsg('question', { timestamp: '99' }),
-        makeMsg('/clear', { timestamp: '100' }),
-      ],
-      deps,
-    );
-    expect(result).toEqual({ handled: true, success: false });
-    expect(clearSession).not.toHaveBeenCalled();
-    expect(deps.advanceCursor).not.toHaveBeenCalled();
+  const pre = (cmd: string) => [
+    makeMsg('question', { timestamp: '99' }),
+    makeMsg(cmd, { timestamp: '100' }),
+  ];
+  const texts = (deps: SessionCommandDeps) =>
+    vi.mocked(deps.sendMessage).mock.calls.map((c) => c[0]);
+
+  it('still clears when the earlier message fails with no output, and says it was dropped', async () => {
+    const clearSession = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({ clearSession, runAgent: failsSilently() });
+
+    const result = await run(pre('/clear'), deps);
+
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.runAgent).toHaveBeenCalledOnce();
+    expect(clearSession).toHaveBeenCalledOnce();
+    expect(deps.advanceCursor).toHaveBeenLastCalledWith('100');
+    expect(texts(deps)).toEqual([
+      "Your earlier message couldn't be processed and was dropped — please resend it after the clear.",
+      CLEAR_CONFIRMATION,
+    ]);
   });
 
-  it('flags the command as still pending when the pre-step fails after output', async () => {
-    const clearSession = vi.fn();
-    const deps = makeDeps({
-      clearSession,
-      runAgent: vi.fn().mockImplementation(async (_p, onOutput) => {
-        await onOutput({ status: 'success', result: 'partial answer' });
-        return 'error';
-      }),
-    });
-    const result = await run(
-      [
-        makeMsg('question', { timestamp: '99' }),
-        makeMsg('/clear', { timestamp: '100' }),
-      ],
-      deps,
-    );
-    // The user was told to try again: the caller must not re-run it now.
-    expect(result).toEqual({
+  it('still answers /status and /context when the earlier message fails with no output', async () => {
+    const refreshStatus = vi.fn().mockResolvedValue(undefined);
+    const s = makeDeps({ refreshStatus, runAgent: failsSilently() });
+    expect(await run(pre('/status'), s)).toEqual({
       handled: true,
       success: true,
-      commandPending: true,
     });
-    expect(clearSession).not.toHaveBeenCalled();
-    expect(deps.advanceCursor).toHaveBeenCalledWith('99');
+    expect(refreshStatus).toHaveBeenCalledOnce();
+    expect(s.advanceCursor).toHaveBeenLastCalledWith('100');
+    expect(texts(s)).toEqual([
+      "Your earlier message couldn't be processed and was dropped — please resend it.",
+    ]);
+
+    const c = makeDeps({
+      describeContext: () => 'ctx',
+      runAgent: failsSilently(),
+    });
+    expect(await run(pre('/context'), c)).toEqual({
+      handled: true,
+      success: true,
+    });
+    expect(c.advanceCursor).toHaveBeenLastCalledWith('100');
+    expect(texts(c)).toEqual([
+      "Your earlier message couldn't be processed and was dropped — please resend it.",
+      'ctx',
+    ]);
+  });
+
+  it('still runs host commands when the earlier message fails after output', async () => {
+    const clearSession = vi.fn().mockResolvedValue(undefined);
+    const d = makeDeps({ clearSession, runAgent: failsAfterOutput() });
+    expect(await run(pre('/clear'), d)).toEqual({
+      handled: true,
+      success: true,
+    });
+    expect(clearSession).toHaveBeenCalledOnce();
+    expect(d.advanceCursor).toHaveBeenLastCalledWith('100');
+    // The partial answer already went out; nothing claims it was dropped.
+    expect(texts(d)).toEqual(['partial answer', CLEAR_CONFIRMATION]);
+
+    for (const cmd of ['/status', '/context']) {
+      const refreshStatus = vi.fn().mockResolvedValue(undefined);
+      const deps = makeDeps({
+        refreshStatus,
+        describeContext: () => 'ctx',
+        runAgent: failsAfterOutput(),
+      });
+      await run(pre(cmd), deps);
+      expect(deps.advanceCursor).toHaveBeenLastCalledWith('100');
+      if (cmd === '/status') expect(refreshStatus).toHaveBeenCalledOnce();
+      else expect(texts(deps)).toContain('ctx');
+    }
+  });
+
+  it('consumes /compact (without running it) when the earlier message fails', async () => {
+    for (const runAgent of [failsSilently(), failsAfterOutput()]) {
+      const beginCompaction = vi.fn();
+      const deps = makeDeps({ runAgent, beginCompaction });
+
+      const result = await run(pre('/compact'), deps);
+
+      expect(result).toEqual({ handled: true, success: true });
+      expect(runAgent).toHaveBeenCalledOnce(); // never with '/compact'
+      expect(runAgent).not.toHaveBeenCalledWith('/compact', expect.anything());
+      expect(beginCompaction).not.toHaveBeenCalled();
+      expect(deps.advanceCursor).toHaveBeenLastCalledWith('100');
+      const last = texts(deps).at(-1)!;
+      expect(last).toContain('/compact was not run');
+      expect(last).toContain('send /compact again');
+    }
+  });
+
+  it('accepts is_from_me as SQLite-style 1 for admin commands', async () => {
+    const clearSession = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({ clearSession });
+    await handleSessionCommand({
+      missedMessages: [makeMsg('/clear', { is_from_me: 1 as any })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(clearSession).toHaveBeenCalledOnce();
   });
 
   it('is accurate when the session was cleared but some files could not be archived', async () => {

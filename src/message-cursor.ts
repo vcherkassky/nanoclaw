@@ -20,6 +20,16 @@ export function messageCursor(msg: Pick<NewMessage, 'timestamp' | 'seq'>) {
     : msg.timestamp;
 }
 
+/**
+ * Startup guard: a stored cursor whose seq is beyond the DB's highest rowid
+ * (e.g. the DB was restored from an older copy) would hide new same-second
+ * messages, so fall back to the legacy timestamp-only form.
+ */
+export function sanitizeStoredCursor(cursor: string, maxSeq: number): string {
+  const { timestamp, seq } = parseMessageCursor(cursor);
+  return seq !== null && seq > maxSeq ? timestamp : cursor;
+}
+
 /** Split a cursor into its timestamp and seq (null for legacy cursors). */
 export function parseMessageCursor(cursor: string): {
   timestamp: string;
