@@ -72,6 +72,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
+import { messageCursor } from './message-cursor.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
@@ -214,18 +215,50 @@ export { processEmailHeadless as _processEmailHeadless };
  * (long-term memory) is untouched. Tracking is dropped even if archiving
  * fails part-way, so the next run never resumes the cleared session by id.
  */
-function clearGroupSession(group: RegisteredGroup): void {
+function clearGroupSession(group: RegisteredGroup): {
+  archiveFailures: number;
+} {
   const previous = sessions[group.folder] ?? null;
   try {
-    const archived = archiveSessionFiles(group.folder);
-    logger.info(
-      { group: group.folder, previous, archived },
-      'Session cleared; transcripts archived',
-    );
+    const { archived, failed, errors } = archiveSessionFiles(group.folder);
+    if (failed.length > 0) {
+      // These stay visible to findLatestSessionId; the reconcile fallback
+      // could only adopt one if a run also lost its streaming marker.
+      logger.error(
+        { group: group.folder, previous, archived, failed, errors },
+        'Session cleared, but some transcripts could not be archived',
+      );
+    } else {
+      logger.info(
+        { group: group.folder, previous, archived },
+        'Session cleared; transcripts archived',
+      );
+    }
+    return { archiveFailures: failed.length };
   } finally {
     delete sessions[group.folder];
     deleteSession(group.folder);
+    if (previous) warnedContextSessions.delete(previous);
   }
+}
+
+/**
+ * Whether these messages would make the agent respond in this group: main
+ * and no-trigger groups always; otherwise only with a trigger from a sender
+ * who is allowed to use it.
+ */
+function hasAllowedTrigger(
+  group: RegisteredGroup,
+  chatJid: string,
+  msgs: NewMessage[],
+): boolean {
+  if (group.isMain === true || group.requiresTrigger === false) return true;
+  const allowlistCfg = loadSenderAllowlist();
+  return msgs.some(
+    (m) =>
+      TRIGGER_PATTERN.test(m.content.trim()) &&
+      (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+  );
 }
 
 /**
@@ -267,8 +300,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       runAgent: (prompt, onOutput) =>
         runAgent(group, prompt, chatJid, onOutput),
       closeStdin: () => queue.closeStdin(chatJid),
-      advanceCursor: (ts) => {
-        lastAgentTimestamp[chatJid] = ts;
+      advanceCursor: (cursor) => {
+        lastAgentTimestamp[chatJid] = cursor;
         saveState();
       },
       formatMessages,
@@ -290,14 +323,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           group.folder,
           sessions[group.folder],
         );
-        return () =>
-          checkCompactionOutcome(
+        return () => {
+          const outcome = checkCompactionOutcome(
             group.folder,
             sessions[group.folder],
             snapshot,
           );
+          if (outcome.compacted) {
+            // Compaction keeps the session id, so re-arm the size warning.
+            if (snapshot.sessionId)
+              warnedContextSessions.delete(snapshot.sessionId);
+            const current = sessions[group.folder];
+            if (current) warnedContextSessions.delete(current);
+          }
+          return outcome;
+        };
       },
       clearSession: () => clearGroupSession(group),
+      shouldProcessPreMessages: (msgs) =>
+        hasAllowedTrigger(group, chatJid, msgs),
       refreshStatus: refreshStatus ? () => refreshStatus!() : undefined,
     },
   });
@@ -307,8 +351,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // the DB until some unrelated message arrives. The cursor strictly
     // advanced, so re-enqueueing always makes progress; while this run is
     // active the queue just marks it pending and drains it right after.
+    // Not when the command itself is still pending after a failed pre-step:
+    // the user was just told to try again, so don't run it behind their back.
     if (
       cmdResult.success &&
+      !cmdResult.commandPending &&
       getMessagesSince(
         chatJid,
         lastAgentTimestamp[chatJid] || '',
@@ -322,9 +369,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // --- End session command interception ---
 
   // --- Context-size warning ---
-  // Fire once per session ID. After /compact succeeds the SDK returns a new
-  // session ID, so the next message's check will see a fresh (small) file
-  // and the warning is naturally re-armed.
+  // Fire once per session ID. /compact keeps the same session ID (the
+  // boundary is appended to the same transcript), so a successful /compact
+  // (and /clear) explicitly re-arms it by dropping the id from the set.
   // Prefer the model-reported prompt size; the bytes/4 transcript estimate
   // overstates real context ~4× (thinking blocks, base64 tool results, and
   // metadata all live in the jsonl), so it's only a labelled fallback.
@@ -359,16 +406,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // --- End context-size warning ---
 
   // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) {
-      return true;
-    }
+  if (!hasAllowedTrigger(group, chatJid, missedMessages)) {
+    return true;
   }
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
@@ -376,8 +415,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  lastAgentTimestamp[chatJid] = messageCursor(
+    missedMessages[missedMessages.length - 1],
+  );
   saveState();
 
   logger.info(
@@ -704,6 +744,99 @@ async function processEmailHeadless(msg: NewMessage): Promise<void> {
   }
 }
 
+/**
+ * Message loop, per group: decide what to do with the newly seen messages —
+ * hand a session command to processGroupMessages (closing the live container
+ * if the sender may run it), pipe ordinary messages into a live container,
+ * or enqueue the group for a new container.
+ */
+function dispatchGroupMessages(
+  chatJid: string,
+  groupMessages: NewMessage[],
+): void {
+  const group = registeredGroups[chatJid];
+  if (!group) return;
+
+  const channel = findChannel(channels, chatJid);
+  if (!channel) {
+    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+    return;
+  }
+
+  const isMainGroup = group.isMain === true;
+
+  // --- Session command interception (message loop) ---
+  // Scan ALL messages in the batch for a session command.
+  const loopCmdMsg = groupMessages.find(
+    (m) => extractSessionCommand(m.content, TRIGGER_PATTERN) !== null,
+  );
+
+  if (loopCmdMsg) {
+    // Only close active container if the sender is authorized — otherwise an
+    // untrusted user could kill in-flight work by sending /compact (DoS).
+    // closeStdin no-ops internally when no container is active.
+    if (isSessionCommandAllowed(isMainGroup, !!loopCmdMsg.is_from_me)) {
+      queue.closeStdin(chatJid);
+    }
+    // Enqueue so processGroupMessages handles auth + cursor advancement.
+    // Don't pipe via IPC — slash commands need a fresh container with
+    // string prompt (not MessageStream) for SDK recognition.
+    queue.enqueueMessageCheck(chatJid);
+    return;
+  }
+  // --- End session command interception ---
+
+  // For non-main groups, only act on trigger messages.
+  // Non-trigger messages accumulate in DB and get pulled as
+  // context when a trigger eventually arrives.
+  if (!hasAllowedTrigger(group, chatJid, groupMessages)) return;
+
+  // Pull all messages since lastAgentTimestamp so non-trigger
+  // context that accumulated between triggers is included.
+  const allPending = getMessagesSince(
+    chatJid,
+    lastAgentTimestamp[chatJid] || '',
+    ASSISTANT_NAME,
+  );
+  const messagesToSend = allPending.length > 0 ? allPending : groupMessages;
+  const formatted = formatMessages(messagesToSend, TIMEZONE);
+
+  // A session command from an earlier poll is still waiting for the
+  // closing container to exit (e.g. "/clear" then "hi"): don't pipe,
+  // or the cursor would skip the command and "hi" would land in the
+  // old session. Enqueue so both are handled in order.
+  if (
+    hasPendingAuthorizedSessionCommand(
+      messagesToSend,
+      isMainGroup,
+      TRIGGER_PATTERN,
+    )
+  ) {
+    queue.enqueueMessageCheck(chatJid);
+  } else if (queue.sendMessage(chatJid, formatted)) {
+    logger.info(
+      { group: group.name, count: messagesToSend.length },
+      'Piped messages to active container',
+    );
+    lastAgentTimestamp[chatJid] = messageCursor(
+      messagesToSend[messagesToSend.length - 1],
+    );
+    saveState();
+    // Show typing indicator while the container processes the piped message
+    channel
+      .setTyping?.(chatJid, true)
+      ?.catch((err) =>
+        logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+      );
+  } else {
+    // No active container — enqueue for a new one
+    queue.enqueueMessageCheck(chatJid);
+  }
+}
+
+/** @internal - exported for testing */
+export { dispatchGroupMessages as _dispatchGroupMessages };
+
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');
@@ -741,100 +874,7 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-            continue;
-          }
-
-          const isMainGroup = group.isMain === true;
-
-          // --- Session command interception (message loop) ---
-          // Scan ALL messages in the batch for a session command.
-          const loopCmdMsg = groupMessages.find(
-            (m) => extractSessionCommand(m.content, TRIGGER_PATTERN) !== null,
-          );
-
-          if (loopCmdMsg) {
-            // Only close active container if the sender is authorized — otherwise an
-            // untrusted user could kill in-flight work by sending /compact (DoS).
-            // closeStdin no-ops internally when no container is active.
-            if (
-              isSessionCommandAllowed(
-                isMainGroup,
-                loopCmdMsg.is_from_me === true,
-              )
-            ) {
-              queue.closeStdin(chatJid);
-            }
-            // Enqueue so processGroupMessages handles auth + cursor advancement.
-            // Don't pipe via IPC — slash commands need a fresh container with
-            // string prompt (not MessageStream) for SDK recognition.
-            queue.enqueueMessageCheck(chatJid);
-            continue;
-          }
-          // --- End session command interception ---
-
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
-
-          // A session command from an earlier poll is still waiting for the
-          // closing container to exit (e.g. "/clear" then "hi"): don't pipe,
-          // or the cursor would skip the command and "hi" would land in the
-          // old session. Enqueue so both are handled in order.
-          if (
-            hasPendingAuthorizedSessionCommand(
-              messagesToSend,
-              isMainGroup,
-              TRIGGER_PATTERN,
-            )
-          ) {
-            queue.enqueueMessageCheck(chatJid);
-          } else if (queue.sendMessage(chatJid, formatted)) {
-            logger.info(
-              { group: group.name, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
+          dispatchGroupMessages(chatJid, groupMessages);
         }
       }
     } catch (err) {

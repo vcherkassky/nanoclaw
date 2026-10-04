@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { messageCursor, parseMessageCursor } from './message-cursor.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -283,13 +284,29 @@ export function setLastGroupSync(): void {
 }
 
 /**
+ * Insert or update a message. An upsert (not INSERT OR REPLACE) keeps the
+ * row's rowid stable when a channel re-delivers a message: rowid is the
+ * insertion-order tiebreak in message cursors (message-cursor.ts), and a
+ * REPLACE would give the message a new, higher rowid and resurface it past
+ * a cursor that had already consumed it.
+ */
+const UPSERT_MESSAGE_SQL = `
+  INSERT INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(id, chat_jid) DO UPDATE SET
+    sender = excluded.sender,
+    sender_name = excluded.sender_name,
+    content = excluded.content,
+    timestamp = excluded.timestamp,
+    is_from_me = excluded.is_from_me,
+    is_bot_message = excluded.is_bot_message`;
+
+/**
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
 export function storeMessage(msg: NewMessage): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  db.prepare(UPSERT_MESSAGE_SQL).run(
     msg.id,
     msg.chat_jid,
     msg.sender,
@@ -314,9 +331,7 @@ export function storeMessageDirect(msg: {
   is_from_me: boolean;
   is_bot_message?: boolean;
 }): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
+  db.prepare(UPSERT_MESSAGE_SQL).run(
     msg.id,
     msg.chat_jid,
     msg.sender,
@@ -337,31 +352,52 @@ export function getNewMessages(
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
+  const after = cursorParams(lastTimestamp);
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   // Subquery takes the N most recent, outer query re-sorts chronologically.
+  // rowid breaks timestamp ties in insertion order (see message-cursor.ts).
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT rowid AS seq, id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
-      WHERE timestamp > ? AND chat_jid IN (${placeholders})
+      WHERE ${AFTER_CURSOR_SQL} AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
-      ORDER BY timestamp DESC
+      ORDER BY timestamp DESC, rowid DESC
       LIMIT ?
-    ) ORDER BY timestamp
+    ) ORDER BY timestamp, seq
   `;
 
-  const rows = db
-    .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+  const rows = (
+    db
+      .prepare(sql)
+      .all(...after, ...jids, `${botPrefix}:%`, limit) as MessageRow[]
+  ).map(toNewMessage);
 
-  let newTimestamp = lastTimestamp;
-  for (const row of rows) {
-    if (row.timestamp > newTimestamp) newTimestamp = row.timestamp;
-  }
+  // Rows are sorted, so the last one is the new high-water mark.
+  const newTimestamp =
+    rows.length > 0 ? messageCursor(rows[rows.length - 1]) : lastTimestamp;
 
   return { messages: rows, newTimestamp };
+}
+
+/** SQL predicate for "after this cursor"; binds the 3 cursorParams values. */
+const AFTER_CURSOR_SQL = '(timestamp > ? OR (timestamp = ? AND rowid > ?))';
+
+function cursorParams(cursor: string): [string, string, number] {
+  const { timestamp, seq } = parseMessageCursor(cursor);
+  // A legacy (timestamp-only) cursor means "after everything at timestamp".
+  return [timestamp, timestamp, seq ?? Number.MAX_SAFE_INTEGER];
+}
+
+type MessageRow = Omit<NewMessage, 'is_from_me'> & {
+  is_from_me: number | boolean | null;
+};
+
+/** SQLite returns is_from_me as 0/1; callers expect a boolean. */
+function toNewMessage(row: MessageRow): NewMessage {
+  return { ...row, is_from_me: !!row.is_from_me };
 }
 
 export function getMessagesSince(
@@ -375,18 +411,25 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT rowid AS seq, id, chat_jid, sender, sender_name, content, timestamp, is_from_me
       FROM messages
-      WHERE chat_jid = ? AND timestamp > ?
+      WHERE chat_jid = ? AND ${AFTER_CURSOR_SQL}
         AND is_bot_message = 0 AND content NOT LIKE ?
         AND content != '' AND content IS NOT NULL
-      ORDER BY timestamp DESC
+      ORDER BY timestamp DESC, rowid DESC
       LIMIT ?
-    ) ORDER BY timestamp
+    ) ORDER BY timestamp, seq
   `;
-  return db
-    .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+  return (
+    db
+      .prepare(sql)
+      .all(
+        chatJid,
+        ...cursorParams(sinceTimestamp),
+        `${botPrefix}:%`,
+        limit,
+      ) as MessageRow[]
+  ).map(toNewMessage);
 }
 
 export function getRecentMessages(
@@ -394,18 +437,20 @@ export function getRecentMessages(
   limit: number = 20,
   since: string = '1970-01-01T00:00:00.000Z',
 ): NewMessage[] {
-  return db
-    .prepare(
-      `SELECT * FROM (
-         SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
-         FROM messages
-         WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
-           AND timestamp > ?
-         ORDER BY timestamp DESC
-         LIMIT ?
-       ) ORDER BY timestamp`,
-    )
-    .all(chatJid, since, limit) as NewMessage[];
+  return (
+    db
+      .prepare(
+        `SELECT * FROM (
+           SELECT rowid AS seq, id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+           FROM messages
+           WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
+             AND timestamp > ?
+           ORDER BY timestamp DESC, rowid DESC
+           LIMIT ?
+         ) ORDER BY timestamp, seq`,
+      )
+      .all(chatJid, since, limit) as MessageRow[]
+  ).map(({ seq: _seq, ...row }) => toNewMessage(row));
 }
 
 export function createTask(

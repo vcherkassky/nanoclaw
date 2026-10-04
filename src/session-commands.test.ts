@@ -1,5 +1,12 @@
-import { describe, it, expect, vi } from 'vitest';
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 import {
+  _initTestDatabase,
+  getMessagesSince,
+  storeChatMetadata,
+  storeMessage,
+} from './db.js';
+import {
+  CLEAR_CONFIRMATION,
   extractSessionCommand,
   handleSessionCommand,
   hasPendingAuthorizedSessionCommand,
@@ -620,6 +627,203 @@ describe('handleSessionCommand', () => {
     expect(result).toEqual({ handled: true, success: false });
     expect(deps.sendMessage).toHaveBeenCalledWith(
       expect.stringContaining('Failed to process'),
+    );
+  });
+});
+
+describe('handleSessionCommand: messages before the command', () => {
+  const run = (msgs: NewMessage[], deps: SessionCommandDeps) =>
+    handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+
+  const answering = (text: string) =>
+    vi.fn().mockImplementation(async (_prompt, onOutput) => {
+      await onOutput({ status: 'success', result: text });
+      await onOutput({ status: 'success', result: null });
+      return 'success';
+    });
+
+  it('answers a question sent before /clear in the old session, then clears', async () => {
+    const clearSession = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({ clearSession, runAgent: answering('4') });
+    const msgs = [
+      makeMsg('what is 2+2?', { timestamp: '99' }),
+      makeMsg('/clear', { timestamp: '100' }),
+    ];
+
+    const result = await run(msgs, deps);
+
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.formatMessages).toHaveBeenCalledWith([msgs[0]], 'UTC');
+    expect(deps.runAgent).toHaveBeenCalledOnce();
+    expect(vi.mocked(deps.runAgent).mock.invocationCallOrder[0]).toBeLessThan(
+      clearSession.mock.invocationCallOrder[0],
+    );
+    expect(vi.mocked(deps.sendMessage).mock.calls.map((c) => c[0])).toEqual([
+      '4',
+      CLEAR_CONFIRMATION,
+    ]);
+    expect(deps.advanceCursor).toHaveBeenLastCalledWith('100');
+  });
+
+  it('answers messages before /context and /status too', async () => {
+    for (const cmd of ['/context', '/status']) {
+      const deps = makeDeps({
+        runAgent: answering('answer'),
+        describeContext: () => 'ctx',
+        refreshStatus: vi.fn().mockResolvedValue(undefined),
+      });
+      await run(
+        [
+          makeMsg('question', { timestamp: '99' }),
+          makeMsg(cmd, { timestamp: '100' }),
+        ],
+        deps,
+      );
+      expect(deps.runAgent).toHaveBeenCalledOnce();
+      expect(deps.sendMessage).toHaveBeenCalledWith('answer');
+      expect(deps.advanceCursor).toHaveBeenLastCalledWith('100');
+    }
+  });
+
+  it('skips the agent for earlier messages that would not trigger it', async () => {
+    const clearSession = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      clearSession,
+      shouldProcessPreMessages: vi.fn().mockReturnValue(false),
+    });
+    await run(
+      [
+        makeMsg('idle chatter', { timestamp: '99' }),
+        makeMsg('/clear', { timestamp: '100' }),
+      ],
+      deps,
+    );
+    expect(deps.runAgent).not.toHaveBeenCalled();
+    expect(clearSession).toHaveBeenCalledOnce();
+  });
+
+  it('does not run the host command when answering earlier messages fails', async () => {
+    const clearSession = vi.fn();
+    const deps = makeDeps({
+      clearSession,
+      runAgent: vi.fn().mockResolvedValue('error'),
+    });
+    const result = await run(
+      [
+        makeMsg('question', { timestamp: '99' }),
+        makeMsg('/clear', { timestamp: '100' }),
+      ],
+      deps,
+    );
+    expect(result).toEqual({ handled: true, success: false });
+    expect(clearSession).not.toHaveBeenCalled();
+    expect(deps.advanceCursor).not.toHaveBeenCalled();
+  });
+
+  it('flags the command as still pending when the pre-step fails after output', async () => {
+    const clearSession = vi.fn();
+    const deps = makeDeps({
+      clearSession,
+      runAgent: vi.fn().mockImplementation(async (_p, onOutput) => {
+        await onOutput({ status: 'success', result: 'partial answer' });
+        return 'error';
+      }),
+    });
+    const result = await run(
+      [
+        makeMsg('question', { timestamp: '99' }),
+        makeMsg('/clear', { timestamp: '100' }),
+      ],
+      deps,
+    );
+    // The user was told to try again: the caller must not re-run it now.
+    expect(result).toEqual({
+      handled: true,
+      success: true,
+      commandPending: true,
+    });
+    expect(clearSession).not.toHaveBeenCalled();
+    expect(deps.advanceCursor).toHaveBeenCalledWith('99');
+  });
+
+  it('is accurate when the session was cleared but some files could not be archived', async () => {
+    const deps = makeDeps({
+      clearSession: vi.fn().mockResolvedValue({ archiveFailures: 2 }),
+    });
+    await run([makeMsg('/clear')], deps);
+    expect(deps.sendMessage).toHaveBeenCalledTimes(1);
+    const text = vi.mocked(deps.sendMessage).mock.calls[0][0];
+    expect(text).toMatch(/^🧹 Session cleared/);
+    expect(text).toContain("couldn't be archived");
+    expect(text).not.toMatch(/failed to clear/i);
+  });
+});
+
+describe('admin session commands with messages read back from SQLite', () => {
+  // SQLite stores is_from_me as 0/1; this guards against comparing it with
+  // `=== true`, which silently denied every admin command in non-main groups.
+  const JID = 'tg:-100';
+  beforeEach(() => {
+    _initTestDatabase();
+    storeChatMetadata(JID, '2026-01-01T00:00:00.000Z');
+  });
+
+  const storeAndLoad = (content: string, isFromMe: boolean) => {
+    storeMessage({
+      id: '1',
+      chat_jid: JID,
+      sender: 'me',
+      sender_name: 'Me',
+      content,
+      timestamp: '2026-01-01T00:00:01.000Z',
+      is_from_me: isFromMe,
+    });
+    return getMessagesSince(JID, '', 'Claw');
+  };
+
+  it('allows an is_from_me /clear in a non-main group', async () => {
+    const msgs = storeAndLoad('@Andy /clear', true);
+    const clearSession = vi.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({ clearSession });
+
+    await handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+
+    expect(clearSession).toHaveBeenCalledOnce();
+    expect(deps.sendMessage).not.toHaveBeenCalledWith(
+      'Session commands require admin access.',
+    );
+    expect(hasPendingAuthorizedSessionCommand(msgs, false, trigger)).toBe(true);
+  });
+
+  it('still denies a non-admin /clear in a non-main group', async () => {
+    const msgs = storeAndLoad('@Andy /clear', false);
+    const clearSession = vi.fn();
+    const deps = makeDeps({ clearSession });
+    await handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(clearSession).not.toHaveBeenCalled();
+    expect(hasPendingAuthorizedSessionCommand(msgs, false, trigger)).toBe(
+      false,
     );
   });
 });

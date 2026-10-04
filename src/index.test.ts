@@ -127,6 +127,7 @@ import {
   _processGroupMessages,
   _processEmailHeadless,
   _resetLastAgentTimestamp,
+  _dispatchGroupMessages,
   _setChannels,
   _setRegisteredGroups,
   _setSessions,
@@ -594,6 +595,115 @@ describe('processGroupMessages — session lifecycle', () => {
       await _processGroupMessages(GROUP_JID);
       expect(enqueue).not.toHaveBeenCalled();
     });
+
+    it('does not re-run a command right after telling the user to try again', async () => {
+      const enqueue = vi
+        .spyOn(GroupQueue.prototype, 'enqueueMessageCheck')
+        .mockImplementation(() => {});
+      say('@Claw question');
+      say('/context');
+      vi.mocked(runContainerAgent).mockImplementationOnce(
+        async (_g, _i, _r, onOutput) => {
+          await onOutput?.({ status: 'success', result: 'partial answer' });
+          return { status: 'error', result: null, error: 'crash' };
+        },
+      );
+
+      await _processGroupMessages(GROUP_JID);
+
+      expect(sent()).toContain('partial answer');
+      expect(sent().some((t: string) => t.includes('Try again'))).toBe(true);
+      expect(enqueue).not.toHaveBeenCalled();
+    });
+
+    it('answers a question sent just before /clear, then clears', async () => {
+      writeSession('cur-sess');
+      await turnWithSession('cur-sess');
+      channel.sendMessage.mockClear();
+      say('@Claw what is 2+2?');
+      say('/clear');
+      let promptSessionId: string | undefined;
+      vi.mocked(runContainerAgent).mockImplementationOnce(
+        async (_g, input, _r, onOutput) => {
+          promptSessionId = input.sessionId;
+          await onOutput?.({
+            status: 'success',
+            result: '4',
+            newSessionId: 'cur-sess',
+          });
+          await onOutput?.({
+            status: 'success',
+            result: null,
+            newSessionId: 'cur-sess',
+          });
+          return { status: 'success', result: null, newSessionId: 'cur-sess' };
+        },
+      );
+
+      await _processGroupMessages(GROUP_JID);
+
+      expect(promptSessionId).toBe('cur-sess'); // answered in the old session
+      expect(sent()).toEqual([
+        '4',
+        '🧹 Session cleared. Your next message starts a fresh conversation (long-term memory in CLAUDE.md is kept).',
+      ]);
+      expect(deleteSession).toHaveBeenCalledWith(TEST_GROUP.folder);
+    });
+  });
+
+  describe('message loop dispatch', () => {
+    let pipe: ReturnType<typeof vi.spyOn>;
+    let enqueue: ReturnType<typeof vi.spyOn>;
+    let close: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      // Pretend a container is alive and accepting piped messages.
+      pipe = vi
+        .spyOn(GroupQueue.prototype, 'sendMessage')
+        .mockReturnValue(true);
+      enqueue = vi
+        .spyOn(GroupQueue.prototype, 'enqueueMessageCheck')
+        .mockImplementation(() => {});
+      close = vi
+        .spyOn(GroupQueue.prototype, 'closeStdin')
+        .mockImplementation(() => {});
+    });
+
+    const latest = () => [store[store.length - 1]] as any;
+
+    it('pipes an ordinary message into the live container', () => {
+      say('@Claw hello');
+      _dispatchGroupMessages(GROUP_JID, latest());
+      expect(pipe).toHaveBeenCalledOnce();
+      expect(enqueue).not.toHaveBeenCalled();
+    });
+
+    it('closes the live container and enqueues for an authorized command', () => {
+      say('/clear');
+      _dispatchGroupMessages(GROUP_JID, latest());
+      expect(close).toHaveBeenCalledWith(GROUP_JID);
+      expect(enqueue).toHaveBeenCalledWith(GROUP_JID);
+      expect(pipe).not.toHaveBeenCalled();
+    });
+
+    it('does not pipe a follow-up while an earlier command is still pending', () => {
+      say('/clear'); // seen by an earlier poll, not yet handled
+      say('@Claw hi'); // this poll
+      _dispatchGroupMessages(GROUP_JID, latest());
+      expect(pipe).not.toHaveBeenCalled();
+      expect(enqueue).toHaveBeenCalledWith(GROUP_JID);
+    });
+
+    it('does not let a non-admin command close the container', () => {
+      _setRegisteredGroups({
+        [GROUP_JID]: { ...TEST_GROUP, isMain: false, requiresTrigger: false },
+      });
+      say('/clear');
+      store[store.length - 1].is_from_me = false;
+      _dispatchGroupMessages(GROUP_JID, latest());
+      expect(close).not.toHaveBeenCalled();
+      expect(enqueue).toHaveBeenCalledWith(GROUP_JID);
+    });
   });
 
   describe('context-size warning', () => {
@@ -648,6 +758,59 @@ describe('processGroupMessages — session lifecycle', () => {
       await _processGroupMessages(GROUP_JID);
       expect(warnings()).toHaveLength(1);
       expect(warnings()[0]).toMatch(/at ~100k tokens \(estimated\)/);
+    });
+
+    it('re-arms after a successful /compact (the session id does not change)', async () => {
+      writeSession('warn-d', `${usageLine(90_000)}\n`);
+      await turnWithSession('warn-d');
+      say('@Claw next');
+      vi.mocked(runContainerAgent).mockResolvedValueOnce({
+        status: 'success',
+        result: null,
+        newSessionId: 'warn-d',
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(warnings()).toHaveLength(1);
+
+      say('/compact');
+      vi.mocked(runContainerAgent).mockImplementationOnce(
+        async (_g, _i, _r, onOutput) => {
+          realFs.appendFileSync(
+            path.join(projDir, 'warn-d.jsonl'),
+            JSON.stringify({
+              type: 'system',
+              subtype: 'compact_boundary',
+              compact_metadata: { preTokens: 90_000 },
+            }) + '\n',
+          );
+          await onOutput?.({
+            status: 'success',
+            result: 'Conversation compacted.',
+            newSessionId: 'warn-d',
+          });
+          return { status: 'success', result: null, newSessionId: 'warn-d' };
+        },
+      );
+      await _processGroupMessages(GROUP_JID);
+      expect(sent().some((t: string) => t.startsWith('🗜️ Compacted'))).toBe(
+        true,
+      );
+
+      // The conversation grows past the threshold again in the same session.
+      realFs.appendFileSync(
+        path.join(projDir, 'warn-d.jsonl'),
+        usageLine(85_000) + '\n',
+      );
+      clearContextMonitorCache();
+      say('@Claw more');
+      vi.mocked(runContainerAgent).mockResolvedValueOnce({
+        status: 'success',
+        result: null,
+        newSessionId: 'warn-d',
+      });
+      await _processGroupMessages(GROUP_JID);
+      expect(warnings()).toHaveLength(2);
+      expect(warnings()[1]).toContain('at 85k tokens');
     });
   });
 });

@@ -1,4 +1,5 @@
 import type { CompactionOutcome } from './context-monitor.js';
+import { messageCursor } from './message-cursor.js';
 import type { NewMessage } from './types.js';
 import { logger } from './logger.js';
 
@@ -24,6 +25,9 @@ const HOST_HANDLED = new Set(['/context', '/status', '/clear']);
 
 export const CLEAR_CONFIRMATION =
   '🧹 Session cleared. Your next message starts a fresh conversation (long-term memory in CLAUDE.md is kept).';
+export const CLEAR_PARTIAL_CONFIRMATION =
+  "🧹 Session cleared, but some old transcript files couldn't be archived (see logs). Your next message starts a fresh conversation.";
+
 /**
  * Check if a session command sender is authorized.
  * Allowed: main group (any sender), or trusted/admin sender (is_from_me) in any group.
@@ -50,7 +54,8 @@ export function hasPendingAuthorizedSessionCommand(
   return pending.some(
     (m) =>
       extractSessionCommand(m.content, triggerPattern) !== null &&
-      isSessionCommandAllowed(isMainGroup, m.is_from_me === true),
+      // !!: rows read from SQLite carry is_from_me as 0/1, not a boolean.
+      isSessionCommandAllowed(isMainGroup, !!m.is_from_me),
   );
 }
 
@@ -69,7 +74,8 @@ export interface SessionCommandDeps {
     onOutput: (result: AgentResult) => Promise<void>,
   ) => Promise<'success' | 'error'>;
   closeStdin: () => void;
-  advanceCursor: (timestamp: string) => void;
+  /** Move the group's cursor to `cursor` (see message-cursor.ts). */
+  advanceCursor: (cursor: string) => void;
   formatMessages: (msgs: NewMessage[], timezone: string) => string;
   /** Whether the denied sender would normally be allowed to interact (for denial messages). */
   canSenderInteract: (msg: NewMessage) => boolean;
@@ -85,12 +91,40 @@ export interface SessionCommandDeps {
   beginCompaction?: () => () => CompactionOutcome;
   /**
    * Forgets the group's tracked session and archives its transcripts so the
-   * next message starts a fresh agent session. Used by /clear.
+   * next message starts a fresh agent session. Used by /clear. Reports how
+   * many transcripts could not be archived (tracking is dropped regardless).
    */
-  clearSession?: () => void | Promise<void>;
+  clearSession?: () =>
+    | void
+    | ClearSessionResult
+    | Promise<void | ClearSessionResult>;
+  /**
+   * Whether messages sent before a host-handled command would normally make
+   * the agent respond (trigger/allowlist rules). If false they are not sent to
+   * the agent. Defaults to true.
+   */
+  shouldProcessPreMessages?: (msgs: NewMessage[]) => boolean;
   /** Triggers an immediate status digest refresh. Used by /status. */
   refreshStatus?: () => Promise<void>;
 }
+
+export interface ClearSessionResult {
+  archiveFailures: number;
+}
+
+export type SessionCommandResult =
+  | { handled: false }
+  | {
+      handled: true;
+      /** false: nothing was consumed; the caller should retry later. */
+      success: boolean;
+      /**
+       * The command itself was NOT run and is still pending (messages before
+       * it were consumed, and the user was asked to try again). The caller
+       * must not immediately re-run it.
+       */
+      commandPending?: true;
+    };
 
 function compactionFailureMessage(reason: string): string {
   return `⚠️ Compaction failed: ${reason}. Session unchanged — use /clear to start fresh.`;
@@ -115,7 +149,7 @@ export async function handleSessionCommand(opts: {
   triggerPattern: RegExp;
   timezone: string;
   deps: SessionCommandDeps;
-}): Promise<{ handled: false } | { handled: true; success: boolean }> {
+}): Promise<SessionCommandResult> {
   const {
     missedMessages,
     isMainGroup,
@@ -134,7 +168,7 @@ export async function handleSessionCommand(opts: {
 
   if (!command || !cmdMsg) return { handled: false };
 
-  if (!isSessionCommandAllowed(isMainGroup, cmdMsg.is_from_me === true)) {
+  if (!isSessionCommandAllowed(isMainGroup, !!cmdMsg.is_from_me)) {
     // DENIED: send denial if the sender would normally be allowed to interact,
     // then silently consume the command by advancing the cursor past it.
     // Trade-off: other messages in the same batch are also consumed (cursor is
@@ -142,61 +176,25 @@ export async function handleSessionCommand(opts: {
     if (deps.canSenderInteract(cmdMsg)) {
       await deps.sendMessage('Session commands require admin access.');
     }
-    deps.advanceCursor(cmdMsg.timestamp);
+    deps.advanceCursor(messageCursor(cmdMsg));
     return { handled: true, success: true };
   }
 
-  // AUTHORIZED: process pre-compact messages first, then run the command
+  // AUTHORIZED: process messages sent before the command first (in the
+  // current session), then run the command.
   logger.info({ group: groupName, command }, 'Session command');
 
-  // Host-handled commands (e.g. /context, /status) don't need the agent.
-  if (HOST_HANDLED.has(command)) {
-    if (command === '/status') {
-      if (deps.refreshStatus) {
-        try {
-          await deps.refreshStatus();
-        } catch (err) {
-          logger.warn({ err }, '/status: refreshStatus failed');
-          await deps.sendMessage('Status refresh failed; see logs.');
-        }
-      } else {
-        await deps.sendMessage('Status digest is not configured.');
-      }
-    } else if (command === '/clear') {
-      // Defensive: this runs inside processGroupMessages, which the GroupQueue
-      // serializes per group, so no container for this group is normally
-      // alive here (the message loop already wrote _close to any idle one
-      // when the command arrived). closeStdin no-ops when nothing is running.
-      deps.closeStdin();
-      if (deps.clearSession) {
-        try {
-          await deps.clearSession();
-          await deps.sendMessage(CLEAR_CONFIRMATION);
-        } catch (err) {
-          logger.error({ err, group: groupName }, '/clear failed');
-          await deps.sendMessage('Failed to clear the session; see logs.');
-        }
-      } else {
-        await deps.sendMessage(
-          'Session clearing is not available in this build.',
-        );
-      }
-    } else {
-      const text = deps.describeContext
-        ? deps.describeContext()
-        : 'Context inspection is not available in this build.';
-      await deps.sendMessage(text);
-    }
-    deps.advanceCursor(cmdMsg.timestamp);
-    return { handled: true, success: true };
-  }
+  const isHostHandled = HOST_HANDLED.has(command);
+  const preCmdMsgs = missedMessages.slice(0, missedMessages.indexOf(cmdMsg));
 
-  const cmdIndex = missedMessages.indexOf(cmdMsg);
-  const preCompactMsgs = missedMessages.slice(0, cmdIndex);
-
-  // Send pre-compact messages to the agent so they're in the session context.
-  if (preCompactMsgs.length > 0) {
-    const prePrompt = deps.formatMessages(preCompactMsgs, timezone);
+  // Send pre-command messages to the agent so they're answered / in the
+  // session context. For host-handled commands only if they'd normally make
+  // the agent respond; otherwise the cursor simply moves past them as before.
+  if (
+    preCmdMsgs.length > 0 &&
+    (!isHostHandled || (deps.shouldProcessPreMessages?.(preCmdMsgs) ?? true))
+  ) {
+    const prePrompt = deps.formatMessages(preCmdMsgs, timezone);
     let hadPreError = false;
     let preOutputSent = false;
 
@@ -216,20 +214,66 @@ export async function handleSessionCommand(opts: {
 
     if (preResult === 'error' || hadPreError) {
       logger.warn(
-        { group: groupName },
-        'Pre-compact processing failed, aborting session command',
+        { group: groupName, command },
+        'Pre-command processing failed, aborting session command',
       );
       await deps.sendMessage(
         `Failed to process messages before ${command}. Try again.`,
       );
       if (preOutputSent) {
         // Output was already sent — don't retry or it will duplicate.
-        // Advance cursor past pre-compact messages, leave command pending.
-        deps.advanceCursor(preCompactMsgs[preCompactMsgs.length - 1].timestamp);
-        return { handled: true, success: true };
+        // Advance cursor past pre-command messages, leave command pending.
+        deps.advanceCursor(messageCursor(preCmdMsgs[preCmdMsgs.length - 1]));
+        return { handled: true, success: true, commandPending: true };
       }
       return { handled: true, success: false };
     }
+  }
+
+  // Host-handled commands (e.g. /context, /status) don't need the agent.
+  if (isHostHandled) {
+    if (command === '/status') {
+      if (deps.refreshStatus) {
+        try {
+          await deps.refreshStatus();
+        } catch (err) {
+          logger.warn({ err }, '/status: refreshStatus failed');
+          await deps.sendMessage('Status refresh failed; see logs.');
+        }
+      } else {
+        await deps.sendMessage('Status digest is not configured.');
+      }
+    } else if (command === '/clear') {
+      // Defensive: this runs inside processGroupMessages, which the GroupQueue
+      // serializes per group, so no container for this group is normally
+      // alive here (the message loop already wrote _close to any idle one
+      // when the command arrived). closeStdin no-ops when nothing is running.
+      deps.closeStdin();
+      if (deps.clearSession) {
+        try {
+          const res = await deps.clearSession();
+          await deps.sendMessage(
+            res && res.archiveFailures > 0
+              ? CLEAR_PARTIAL_CONFIRMATION
+              : CLEAR_CONFIRMATION,
+          );
+        } catch (err) {
+          logger.error({ err, group: groupName }, '/clear failed');
+          await deps.sendMessage('Failed to clear the session; see logs.');
+        }
+      } else {
+        await deps.sendMessage(
+          'Session clearing is not available in this build.',
+        );
+      }
+    } else {
+      const text = deps.describeContext
+        ? deps.describeContext()
+        : 'Context inspection is not available in this build.';
+      await deps.sendMessage(text);
+    }
+    deps.advanceCursor(messageCursor(cmdMsg));
+    return { handled: true, success: true };
   }
 
   // Forward the literal slash command as the prompt (no XML formatting)
@@ -251,7 +295,7 @@ export async function handleSessionCommand(opts: {
   const agentFailed = cmdOutput === 'error' || hadCmdError;
 
   // Advance cursor to the command — messages AFTER it remain pending.
-  deps.advanceCursor(cmdMsg.timestamp);
+  deps.advanceCursor(messageCursor(cmdMsg));
   await deps.setTyping(false);
 
   if (finishCompaction) {

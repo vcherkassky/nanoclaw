@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   archiveSessionFiles,
@@ -15,6 +15,64 @@ import {
   formatSessionEstimate,
   snapshotCompaction,
 } from './context-monitor.js';
+
+// Claude Code writes these locally (no model call), with all-zero usage.
+// Shapes copied from real transcripts (telegram_main, pa_email_processor).
+const SYNTHETIC_NO_RESPONSE_LINE = JSON.stringify({
+  parentUuid: 'e63a8bce',
+  isSidechain: false,
+  type: 'assistant',
+  uuid: '0037633d',
+  timestamp: '2026-10-04T09:26:06.494Z',
+  message: {
+    id: '9825d099',
+    container: null,
+    model: '<synthetic>',
+    role: 'assistant',
+    stop_reason: 'stop_sequence',
+    stop_sequence: '',
+    type: 'message',
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      server_tool_use: { web_search_requests: 0, web_fetch_requests: 0 },
+      service_tier: null,
+      cache_creation: {
+        ephemeral_1h_input_tokens: 0,
+        ephemeral_5m_input_tokens: 0,
+      },
+      inference_geo: null,
+      iterations: null,
+      speed: null,
+    },
+    content: [{ type: 'text', text: 'No response requested.' }],
+    context_management: null,
+  },
+  isApiErrorMessage: false,
+  userType: 'external',
+});
+const SYNTHETIC_API_ERROR_LINE = JSON.stringify({
+  type: 'assistant',
+  message: {
+    model: '<synthetic>',
+    role: 'assistant',
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+    },
+    content: [
+      {
+        type: 'text',
+        text: 'API Error: Unable to connect to API (ECONNREFUSED)',
+      },
+    ],
+  },
+  isApiErrorMessage: true,
+});
 
 describe('estimateSessionTokens', () => {
   let tmpDir: string;
@@ -232,6 +290,53 @@ describe('estimateSessionTokens', () => {
       ttlMs: 0,
     });
     expect(r.actualInputTokens).toBe(4200);
+  });
+
+  it('ignores <synthetic> and zero-usage assistant records when picking the last usage', () => {
+    const lines = [
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          model: 'gemma4:26b',
+          usage: { input_tokens: 50000, cache_read_input_tokens: 912 },
+        },
+      }),
+      SYNTHETIC_NO_RESPONSE_LINE,
+      SYNTHETIC_API_ERROR_LINE,
+      JSON.stringify({
+        type: 'assistant',
+        message: { model: 'gemma4:26b', usage: { input_tokens: 0 } },
+      }),
+    ];
+    makeSessionFile('g', 'sess1', lines.join('\n') + '\n');
+    const r = estimateSessionTokens('sess1', 'g', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(r.actualInputTokens).toBe(50912);
+    expect(r.model).toBe('gemma4:26b');
+  });
+
+  it('falls back to the estimate when only <synthetic> records carry usage', () => {
+    const lines = [
+      JSON.stringify({ type: 'user', pad: 'p'.repeat(4000) }),
+      SYNTHETIC_NO_RESPONSE_LINE,
+    ];
+    makeSessionFile('g', 'sess1', lines.join('\n') + '\n');
+    const r = estimateSessionTokens('sess1', 'g', {
+      dataDir: path.join(tmpDir, 'data'),
+      ttlMs: 0,
+    });
+    expect(r.actualInputTokens).toBeNull();
+    expect(r.model).toBeNull();
+    expect(effectiveContextTokens(r).exact).toBe(false);
+    expect(effectiveContextTokens(r).tokens).toBeGreaterThan(1000);
+    expect(
+      describeGroupContext('g', 'sess1', {
+        dataDir: path.join(tmpDir, 'data'),
+        ttlMs: 0,
+      }),
+    ).not.toContain('<synthetic>');
   });
 
   it('reports null actual tokens when no assistant usage is present', () => {
@@ -689,12 +794,13 @@ describe('archiveSessionFiles', () => {
     // Not a session transcript: must be left alone.
     fs.writeFileSync(path.join(projDir, 'x.jsonl.bak.1'), 'bak');
 
-    const archived = archiveSessionFiles('g', {
+    const result = archiveSessionFiles('g', {
       dataDir,
       now: new Date('2026-10-04T12:00:00.000Z'),
     });
 
-    expect(archived.sort()).toEqual(['current', 'older']);
+    expect(result.archived.sort()).toEqual(['current', 'older']);
+    expect(result.failed).toEqual([]);
     const top = fs.readdirSync(projDir).sort();
     expect(top).toEqual(['cleared', 'x.jsonl.bak.1']);
     const cleared = fs.readdirSync(path.join(projDir, 'cleared')).sort();
@@ -749,12 +855,39 @@ describe('archiveSessionFiles', () => {
     expect(contents).toEqual(['first', 'second']);
   });
 
+  it('keeps archiving the remaining files when one move fails', () => {
+    fs.writeFileSync(path.join(projDir, 'a.jsonl'), 'a');
+    fs.writeFileSync(path.join(projDir, 'b.jsonl'), 'b');
+    fs.writeFileSync(path.join(projDir, 'c.jsonl'), 'c');
+    const realRename = fs.renameSync;
+    const spy = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from).endsWith(`${path.sep}b.jsonl`)) {
+        throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      }
+      return realRename(from, to);
+    });
+    try {
+      const result = archiveSessionFiles('g', { dataDir });
+      expect(result.archived.sort()).toEqual(['a', 'c']);
+      expect(result.failed).toEqual(['b']);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.readdirSync(projDir).sort()).toEqual(['b.jsonl', 'cleared']);
+  });
+
   it('returns [] when the session directory does not exist', () => {
-    expect(archiveSessionFiles('missing', { dataDir })).toEqual([]);
+    expect(archiveSessionFiles('missing', { dataDir })).toEqual({
+      archived: [],
+      failed: [],
+    });
   });
 
   it('rejects unsafe group folders', () => {
-    expect(archiveSessionFiles('../escape', { dataDir })).toEqual([]);
+    expect(archiveSessionFiles('../escape', { dataDir })).toEqual({
+      archived: [],
+      failed: [],
+    });
   });
 });
 
@@ -775,6 +908,13 @@ describe('effectiveContextTokens', () => {
     expect(
       effectiveContextTokens({ ...base, actualInputTokens: 50912 }),
     ).toEqual({ tokens: 50912, exact: true });
+  });
+
+  it('treats a zero or negative reported size as unknown', () => {
+    expect(effectiveContextTokens({ ...base, actualInputTokens: 0 })).toEqual({
+      tokens: 221000,
+      exact: false,
+    });
   });
 
   it('falls back to the byte estimate when no usage was reported', () => {

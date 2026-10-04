@@ -28,6 +28,7 @@ import {
   storeMessage,
   updateTask,
 } from './db.js';
+import { messageCursor, parseMessageCursor } from './message-cursor.js';
 
 beforeEach(() => {
   _initTestDatabase();
@@ -291,7 +292,10 @@ describe('getNewMessages', () => {
     );
     // Excludes bot message, returns 3 user messages
     expect(messages).toHaveLength(3);
-    expect(newTimestamp).toBe('2024-01-01T00:00:04.000Z');
+    // The cursor is <timestamp>|<rowid> of the newest message (message-cursor.ts).
+    expect(parseMessageCursor(newTimestamp).timestamp).toBe(
+      '2024-01-01T00:00:04.000Z',
+    );
   });
 
   it('filters by timestamp', () => {
@@ -436,7 +440,9 @@ describe('message query LIMIT', () => {
     // Chronological order preserved
     expect(messages[1].timestamp > messages[0].timestamp).toBe(true);
     // newTimestamp reflects latest returned row
-    expect(newTimestamp).toBe('2024-01-01T00:00:10.000Z');
+    expect(parseMessageCursor(newTimestamp).timestamp).toBe(
+      '2024-01-01T00:00:10.000Z',
+    );
   });
 
   it('getMessagesSince caps to limit and returns most recent in chronological order', () => {
@@ -836,6 +842,119 @@ describe('agent_runs', () => {
 
   it('returns undefined from getLastAgentRun when the table is empty', () => {
     expect(getLastAgentRun()).toBeUndefined();
+  });
+});
+
+describe('message rows', () => {
+  const JID = 'tg:42';
+  beforeEach(() => {
+    storeChatMetadata(JID, '2026-01-01T00:00:00.000Z');
+  });
+
+  it('returns is_from_me as a real boolean (SQLite stores 0/1)', () => {
+    store({
+      id: 'a',
+      chat_jid: JID,
+      sender: 'me',
+      sender_name: 'Me',
+      content: 'mine',
+      timestamp: '2026-01-01T00:00:01.000Z',
+      is_from_me: true,
+    });
+    store({
+      id: 'b',
+      chat_jid: JID,
+      sender: 'x',
+      sender_name: 'X',
+      content: 'theirs',
+      timestamp: '2026-01-01T00:00:02.000Z',
+    });
+    for (const rows of [
+      getMessagesSince(JID, '', 'Bot'),
+      getNewMessages([JID], '', 'Bot').messages,
+      getRecentMessages(JID),
+    ]) {
+      expect(rows.map((m) => m.is_from_me)).toEqual([true, false]);
+    }
+  });
+});
+
+describe('same-second messages (Telegram has 1 s timestamps)', () => {
+  const JID = 'tg:7';
+  const TS = '2026-10-04T12:00:00.000Z';
+  beforeEach(() => {
+    storeChatMetadata(JID, TS);
+  });
+  const put = (id: string, content: string, timestamp = TS) =>
+    store({
+      id,
+      chat_jid: JID,
+      sender: '1',
+      sender_name: 'V',
+      content,
+      timestamp,
+    });
+
+  it('returns same-timestamp messages in insertion order', () => {
+    // ids chosen so that any id/text ordering would disagree with arrival.
+    put('9', '/clear');
+    put('10', 'what is 2+2?');
+    put('1', 'third');
+    expect(getMessagesSince(JID, '', 'Bot').map((m) => m.content)).toEqual([
+      '/clear',
+      'what is 2+2?',
+      'third',
+    ]);
+    expect(
+      getNewMessages([JID], '', 'Bot').messages.map((m) => m.content),
+    ).toEqual(['/clear', 'what is 2+2?', 'third']);
+  });
+
+  it('a cursor at a message keeps later same-second messages pending', () => {
+    put('101', '/clear');
+    put('102', 'what is 2+2?');
+    const [cmd] = getMessagesSince(JID, '', 'Bot');
+
+    const rest = getMessagesSince(JID, messageCursor(cmd), 'Bot');
+
+    expect(rest.map((m) => m.content)).toEqual(['what is 2+2?']);
+  });
+
+  it('re-storing a message (channel re-delivery) does not resurface it past a cursor', () => {
+    put('101', 'hello');
+    put('102', 'world');
+    const msgs = getMessagesSince(JID, '', 'Bot');
+    const cursor = messageCursor(msgs[1]);
+
+    put('101', 'hello'); // e.g. WhatsApp upsert of an already-seen message
+
+    expect(getMessagesSince(JID, cursor, 'Bot')).toEqual([]);
+    expect(getNewMessages([JID], cursor, 'Bot').messages).toEqual([]);
+  });
+
+  it('a legacy timestamp-only cursor behaves exactly as before', () => {
+    put('101', 'a');
+    put('102', 'b');
+    put('103', 'later', '2026-10-04T12:00:01.000Z');
+    expect(getMessagesSince(JID, TS, 'Bot').map((m) => m.content)).toEqual([
+      'later',
+    ]);
+  });
+
+  it('the global poll cursor does not drop a message arriving later in the same second', () => {
+    put('101', 'first');
+    const first = getNewMessages([JID], '', 'Bot');
+    expect(first.messages.map((m) => m.content)).toEqual(['first']);
+
+    put('102', 'second, same second');
+    const second = getNewMessages([JID], first.newTimestamp, 'Bot');
+
+    expect(second.messages.map((m) => m.content)).toEqual([
+      'second, same second',
+    ]);
+    const third = getNewMessages([JID], second.newTimestamp, 'Bot');
+    expect(third.messages).toEqual([]);
+    expect(third.newTimestamp).toBe(second.newTimestamp);
   });
 });
 

@@ -53,6 +53,8 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  /** SQLite rowid (insertion order); set on rows read from the DB. */
+  seq?: number;
   thread_id?: string;
   reply_to_message_id?: string;
   reply_to_message_content?: string;

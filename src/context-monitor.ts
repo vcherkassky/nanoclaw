@@ -133,11 +133,18 @@ function scanForLastBoundary(file: string): {
           const usage =
             obj.type === 'assistant' ? obj.message?.usage : undefined;
           if (usage && typeof usage.input_tokens === 'number') {
-            actualInputTokens =
+            const total =
               usage.input_tokens +
               (usage.cache_read_input_tokens ?? 0) +
               (usage.cache_creation_input_tokens ?? 0);
-            model = obj.message?.model ?? model;
+            // Claude Code writes `<synthetic>` assistant records locally
+            // ("No response requested.", API-error notices) with all-zero
+            // usage. They say nothing about context size; skip them (and any
+            // other zero-usage record) so they don't mask the last real turn.
+            if (obj.message?.model !== '<synthetic>' && total > 0) {
+              actualInputTokens = total;
+              model = obj.message?.model ?? model;
+            }
           }
         } catch {
           /* malformed line; skip */
@@ -587,7 +594,7 @@ export function effectiveContextTokens(e: SessionEstimate): {
   tokens: number;
   exact: boolean;
 } {
-  return e.actualInputTokens !== null
+  return e.actualInputTokens !== null && e.actualInputTokens > 0
     ? { tokens: e.actualInputTokens, exact: true }
     : { tokens: e.estimatedTokens, exact: false };
 }
@@ -601,54 +608,69 @@ export function effectiveContextTokens(e: SessionEstimate): {
  * `findLatestSessionId` adopts whichever top-level jsonl is newest: leaving an
  * older session in place would let the reconcile fallback (or `/context`)
  * resurrect it. Nothing is deleted; files stay recoverable from `cleared/`.
- * Returns the archived session ids.
+ *
+ * A failure on one transcript doesn't stop the rest from being archived;
+ * the ids that could not be moved are returned in `failed` (with `errors`
+ * for logging) so the caller can tell the user honestly.
  */
 export function archiveSessionFiles(
   groupFolder: string,
   opts: { dataDir?: string; now?: Date } = {},
-): string[] {
+): { archived: string[]; failed: string[]; errors?: unknown[] } {
   const dataDir = opts.dataDir ?? DATA_DIR;
   const dir = sessionDirPath(dataDir, groupFolder);
-  if (!dir) return [];
+  if (!dir) return { archived: [], failed: [] };
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
-    return [];
+    return { archived: [], failed: [] };
   }
   const stamp = (opts.now ?? new Date()).toISOString().replace(/[:.]/g, '-');
   const clearedDir = path.join(dir, 'cleared');
   const archived: string[] = [];
+  const failed: string[] = [];
+  const errors: unknown[] = [];
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
     const sessionId = entry.name.slice(0, -'.jsonl'.length);
     if (!SAFE_NAME.test(sessionId)) continue;
-    fs.mkdirSync(clearedDir, { recursive: true });
     let base = `${stamp}-${sessionId}`;
-    for (
-      let n = 1;
-      fs.existsSync(path.join(clearedDir, `${base}.jsonl`)) ||
-      fs.existsSync(path.join(clearedDir, base));
-      n++
-    ) {
-      base = `${stamp}-${sessionId}-${n}`;
+    try {
+      fs.mkdirSync(clearedDir, { recursive: true });
+      for (
+        let n = 1;
+        fs.existsSync(path.join(clearedDir, `${base}.jsonl`)) ||
+        fs.existsSync(path.join(clearedDir, base));
+        n++
+      ) {
+        base = `${stamp}-${sessionId}-${n}`;
+      }
+      fs.renameSync(
+        path.join(dir, entry.name),
+        path.join(clearedDir, `${base}.jsonl`),
+      );
+    } catch (err) {
+      failed.push(sessionId);
+      errors.push(err);
+      continue;
     }
-    fs.renameSync(
-      path.join(dir, entry.name),
-      path.join(clearedDir, `${base}.jsonl`),
-    );
+    // The sibling dir holds subagent/tool-result files; it is never picked up
+    // as a session by findLatestSessionId, so failing to move it is harmless.
     const siblingDir = path.join(dir, sessionId);
     try {
       if (fs.statSync(siblingDir).isDirectory()) {
         fs.renameSync(siblingDir, path.join(clearedDir, base));
       }
     } catch {
-      // No sibling directory for this session.
+      // No sibling directory for this session (or it couldn't be moved).
     }
     archived.push(sessionId);
   }
   cache.clear();
-  return archived;
+  return errors.length > 0
+    ? { archived, failed, errors }
+    : { archived, failed };
 }
 
 /** Clear in-memory cache. Useful for tests; also called after /compact. */
